@@ -1,4 +1,4 @@
-# DLSS 5 Neural Rendering auf AMD RX 6800 / 6900 (experimentell)
+# DLSS 5 Neural Rendering auf AMD-RX-6000-Karten (experimentell)
 
 **English:** [README.md](README.md)
 
@@ -10,7 +10,7 @@ NVIDIA hat eine neue Grafik-Funktion gebaut: **DLSS Neural Rendering** („DLSS 
 realistischer aus: besseres Licht, mehr Details, schönere Farben. Normalerweise geht das **nur mit
 NVIDIA-Grafikkarten**.
 
-Diese Mod bringt es auf **AMD Radeon RX 6800, 6800 XT, 6900 XT und 6950 XT**.
+Diese Mod bringt es auf **AMD-Radeon-RX-6000-Karten** (RDNA2).
 
 > **Experimentell.** Kann abstürzen, falsch aussehen oder viele FPS kosten. Nicht in Online-Spielen
 > mit Anti-Cheat benutzen.
@@ -21,11 +21,21 @@ Du brauchst **alles** davon:
 
 | | |
 |---|---|
-| ✅ Grafikkarte | AMD **RX 6800**, **RX 6800 XT**, **RX 6900 XT** oder **RX 6950 XT**. Andere Karten (RX 6700, RX 6600, RX 7000, NVIDIA, Intel) gehen **nicht**. |
+| ✅ Grafikkarte | AMD **RX-6000-Serie**, siehe Tabelle unten. RX 7000/9000, NVIDIA und Intel gehen **nicht**. |
 | ✅ Windows | Windows 10 oder 11, 64-Bit |
 | ✅ AMD-Treiber | Ein aktueller AMD-Adrenalin-Treiber ([Download](https://www.amd.com/de/support/download/drivers.html)) |
 | ✅ Spiel | Ein 64-Bit-Spiel mit DirectX 11 oder 12, in dem du in den Grafikeinstellungen **DLSS, FSR oder XeSS** auswählen kannst |
 | ✅ NVIDIA-Modelldatei | `nvngx_dlssnr.dll`. **Nicht dabei**, die musst du dir selbst besorgen (Schritt 2) |
+
+| Grafikkarte | Status | Zeit pro Modell-Frame |
+|---|---|---|
+| RX 6800 / 6800 XT / 6900 XT / 6950 XT | ✅ getestet | ~40 ms |
+| RX 6700 / 6700 XT / 6750 XT | 🧪 sollte gehen, **ungetestet** (v0.2-beta) | ~80 ms (geschätzt) |
+| RX 6600 / 6600 XT / 6650 XT | 🧪 sollte gehen, **ungetestet** (v0.2-beta) | ~110 ms (geschätzt) |
+| RX 6500 XT / 6400 | 🧪 sollte gehen, sehr langsam | 250 ms+ |
+
+**Du hast eine RX 6700 oder RX 6600?** Probier bitte v0.2-beta aus und schreib in [Issues](../../issues),
+ob es geht (mit deiner `dlssnr_nr.log`).
 
 Du weißt nicht, welche Grafikkarte du hast? Drück `Strg + Umschalt + Esc`, klick auf **Leistung**, dann
 auf **GPU**. Der Name steht oben rechts.
@@ -34,7 +44,7 @@ auf **GPU**. Der Name steht oben rechts.
 
 ### Schritt 1: Herunterladen
 
-Geh zu [**Releases**](../../releases/latest) und lade `DLSS5-RDNA2-Experimental-v0.1.zip` herunter.
+Geh zu [**Releases**](../../releases/latest) und lade die ZIP (`DLSS5-RDNA2-Experimental-...zip`) herunter. RX 6700 / 6600 / 6500: nimm **v0.2-beta**.
 
 ### Schritt 2: NVIDIA-Modelldatei besorgen
 
@@ -92,7 +102,8 @@ Der erste Start dauert ein paar Sekunden länger. Das ist normal.
 |---|---|
 | `runtime ready` | Läuft. Prüfe, ob Neural Rendering im `Einfg`-Menü an ist. |
 | `nvngx_dlssnr.dll missing or wrong version` | `nvngx_dlssnr.dll` fehlt im Spielordner oder hat andere Gewichte. Neu besorgen (Schritt 2). |
-| `not gfx1030` | Deine Grafikkarte wird nicht unterstützt (siehe „Geht das auf meinem PC?“). |
+| `not an RDNA2 GPU` | Deine Grafikkarte wird nicht unterstützt (siehe „Geht das auf meinem PC?“). |
+| `hipModuleLoad ...` | Deine Karte konnte das Programm nicht laden. Bitte in [Issues](../../issues) mit Log melden. |
 | Es gibt gar keine `dlssnr_nr.log` | Die Mod wurde nicht geladen. `setup_windows.bat` nochmal ausführen und prüfen, ob im Spiel ein Upscaler an ist. |
 
 ## Deinstallieren
@@ -103,7 +114,7 @@ Doppelklick im Spielordner auf **`Remove_OptiScaler.bat`**. Danach `nr_data`, `n
 ## Wird das Spiel schneller oder langsamer?
 
 Langsamer. Die AMD-Karte muss Arbeit machen, für die NVIDIA-Karten Spezial-Hardware haben. Auf einer
-RX 6900 XT braucht ein Modell-Frame ca. 40 ms. Rechne mit deutlich weniger FPS. Das ist eine Tech-Demo,
+RX 6900 XT braucht ein Modell-Frame ca. 40 ms, kleinere Karten länger (siehe Tabelle oben). Rechne mit deutlich weniger FPS. Das ist eine Tech-Demo,
 keine Performance-Mod.
 
 ## Wer hat was gemacht?

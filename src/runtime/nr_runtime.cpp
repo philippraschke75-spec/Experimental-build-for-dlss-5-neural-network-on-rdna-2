@@ -27,7 +27,7 @@ struct nr_ctx {
   std::map<std::string, NrOverride> ovr;   // see OVERRIDES.md; empty -> unchanged behaviour
   std::string dir; uint8_t* d = nullptr; size_t arena = 0; uint64_t base = 0, dev = 0;
   size_t off_src = 0, src_size = 0, off_dst = 0, dst_size = 0; int vit_lo = 0, vit_hi = 0, vit_every = 1; long frame = 0;
-  std::vector<Step> steps; std::vector<hipModule_t> mods; hipEvent_t e0 = nullptr, e1 = nullptr;
+  std::vector<Step> steps; std::vector<hipModule_t> mods; unsigned mach = 0x36; std::deque<std::vector<uint8_t>> imgs; hipEvent_t e0 = nullptr, e1 = nullptr;
   // strength = the two f32 pairs of k_pre_block PreParams: +0x28 (LocalTone, LocalStructure) and +0x48 (a, b). Set from any thread, applied at the start of the next run.
   std::mutex mx; float str[4] = {0, 0, 1, 1}; float pend[4] = {0, 0, 1, 1}; bool dirty = false;
   // D3D12 interop (nr_ext_*): imported shared buffers, own non-blocking stream, one event per queued frame
@@ -97,6 +97,31 @@ static bool upload_arena(nr_ctx* c) {   // pristine arena between two 0xA5 guard
   return hipMemcpy(c->d, host.data(), host.size(), hipMemcpyHostToDevice) == hipSuccess;
 }
 
+// Kernels are built for gfx1030. Every RDNA2 chip (gfx1030-1036) runs the same ISA (LLVM's gfx10-3-generic), so other
+// RDNA2 cards only need the ELF e_flags machine id relabelled at load time. Clang offload bundles are unwrapped first.
+static unsigned rdna2_mach(const char* arch) {
+  static const struct { const char* n; unsigned m; } t[] = {{"gfx1030", 0x36}, {"gfx1031", 0x37}, {"gfx1032", 0x38}, {"gfx1033", 0x39},
+                                                            {"gfx1034", 0x3e}, {"gfx1035", 0x3d}, {"gfx1036", 0x45}};
+  for (auto& e : t) if (!strncmp(arch, e.n, 7) && (arch[7] == 0 || arch[7] == ':')) return e.m;
+  return 0;
+}
+static hipError_t load_mod(nr_ctx* c, const std::string& path, hipModule_t* m) {
+  std::vector<uint8_t> b; if (!rd(path, b)) return hipErrorFileNotFound;
+  if (b.size() > 32 && !memcmp(b.data(), "__CLANG_OFFLOAD_BUNDLE__", 24)) {   // u64 n, then n x (u64 off, u64 size, u64 idlen, id)
+    uint64_t n, off, sz, il; size_t o = 32; memcpy(&n, b.data() + 24, 8); std::vector<uint8_t> elf;
+    for (uint64_t i = 0; i < n && o + 24 <= b.size(); i++) {
+      memcpy(&off, b.data() + o, 8); memcpy(&sz, b.data() + o + 8, 8); memcpy(&il, b.data() + o + 16, 8); o += 24;
+      std::string id((const char*)b.data() + o, (size_t)il); o += (size_t)il;
+      if (id.find("gfx1030") != std::string::npos && off + sz <= b.size()) elf.assign(b.begin() + off, b.begin() + off + sz);
+    }
+    if (elf.empty()) return hipErrorInvalidImage;
+    b.swap(elf);
+  }
+  if (b.size() > 0x34 && b[0] == 0x7f && !memcmp(b.data() + 1, "ELF", 3) && b[0x30] == 0x36) b[0x30] = (uint8_t)c->mach;   // EF_AMDGPU_MACH, low byte
+  c->imgs.push_back(std::move(b));   // kept alive for the module's lifetime
+  return hipModuleLoadData(m, c->imgs.back().data());
+}
+
 NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_every, char* err, int errlen) {
   nr_ctx* c = new nr_ctx; c->dir = data_dir; c->vit_every = vit_every < 1 ? 1 : vit_every;
   std::map<std::string, std::string> kv;   // meta.txt: key=value
@@ -109,7 +134,7 @@ NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_ev
   if (c->vit_every > 1 && num("off_vitres") == num("off_headb")) FAIL("vit_every>1 needs data generated with VIT_OWN=1");
 
   hipDeviceProp_t p{}; HK(hipGetDeviceProperties(&p, 0));
-  if (strcmp(p.gcnArchName, "gfx1030")) FAIL("not gfx1030: %s", p.gcnArchName);
+  c->mach = rdna2_mach(p.gcnArchName); if (!c->mach) FAIL("not an RDNA2 GPU (gfx1030-1036): %s", p.gcnArchName);
   HK(hipMalloc(&c->d, c->arena + 2 * PAD)); c->dev = (uint64_t)(c->d + PAD);
   if (!upload_arena(c)) FAIL("arena data missing/wrong size, nvngx_dlssnr.dll missing or wrong version next to %s, or upload failed", data_dir);
 
@@ -124,7 +149,7 @@ NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_ev
     for (;;) { size_t q = s.find('|', pos); if (q == std::string::npos) { t.push_back(s.substr(pos)); break; } t.push_back(s.substr(pos, q - pos)); pos = q + 1; }
     if (t.size() != 7 && t.size() != 8) { fclose(f); FAIL("bad manifest line: %s", line); }
     t[0] = rel(c->dir, t[0]);
-    if (!mods.count(t[0])) { hipModule_t m; hipError_t e = hipModuleLoad(&m, t[0].c_str()); if (e != hipSuccess) { fclose(f); FAIL("hipModuleLoad %s: %s", t[0].c_str(), hipGetErrorString(e)); } mods[t[0]] = m; c->mods.push_back(m); }
+    if (!mods.count(t[0])) { hipModule_t m; hipError_t e = load_mod(c, t[0], &m); if (e != hipSuccess) { fclose(f); FAIL("hipModuleLoad %s: %s", t[0].c_str(), hipGetErrorString(e)); } mods[t[0]] = m; c->mods.push_back(m); }
     Step st; st.pre = t[1].find("k_pre_block") != std::string::npos; hipError_t e = hipModuleGetFunction(&st.fn, mods[t[0]], t[1].c_str()); if (e != hipSuccess) { fclose(f); FAIL("no symbol %s", t[1].c_str()); }
     size_t off = strtoull(t[2].c_str(), nullptr, 10), len = strtoull(t[3].c_str(), nullptr, 10);
     if (off + len > kab.size()) { fclose(f); FAIL("kernarg out of range"); }
@@ -138,7 +163,7 @@ NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_ev
     if (ov != c->ovr.end()) {   // swap in the native kernel; its kernarg is rebuilt from the original one (also after strength patches)
       NrOverride& o = ov->second; st.ov = &o;
       o.mod = rel(c->dir, o.mod);
-      if (!mods.count(o.mod)) { hipModule_t m; hipError_t e = hipModuleLoad(&m, o.mod.c_str()); if (e != hipSuccess) { fclose(f); FAIL("hipModuleLoad %s: %s", o.mod.c_str(), hipGetErrorString(e)); } mods[o.mod] = m; c->mods.push_back(m); }
+      if (!mods.count(o.mod)) { hipModule_t m; hipError_t e = load_mod(c, o.mod, &m); if (e != hipSuccess) { fclose(f); FAIL("hipModuleLoad %s: %s", o.mod.c_str(), hipGetErrorString(e)); } mods[o.mod] = m; c->mods.push_back(m); }
       if (hipModuleGetFunction(&st.fn, mods[o.mod], o.sym.c_str()) != hipSuccess) { fclose(f); FAIL("no symbol %s", o.sym.c_str()); }
       st.gx = nr_grid(o.g[0], st.gx); st.gy = nr_grid(o.g[1], st.gy); st.gz = nr_grid(o.g[2], st.gz); st.thr = nr_grid(o.g[3], st.thr);
       st.src.swap(st.ka); if (!nr_apply_override(o, st.src, st.ka)) { fclose(f); FAIL("override for %s copies past the original kernarg", t[1].c_str()); }
