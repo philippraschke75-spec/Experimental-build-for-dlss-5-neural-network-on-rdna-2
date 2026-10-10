@@ -29,7 +29,7 @@ You need **all** of these:
 | Graphics card | Status | Time per model frame |
 |---|---|---|
 | RX 6800 / 6800 XT / 6900 XT / 6950 XT | ✅ tested | ~40 ms |
-| RX 6700 / 6700 XT / 6750 XT | 🧪 should work, **untested** (v0.2-beta) | ~80 ms (estimate) |
+| RX 6700 / 6700 XT / 6750 XT | 🧪 loads, confirmed by a user (RX 6700 XT); in-game result still being checked (v0.2-beta) | ~80 ms (estimate) |
 | RX 6600 / 6600 XT / 6650 XT | 🧪 should work, **untested** (v0.2-beta) | ~110 ms (estimate) |
 | RX 6500 XT / 6400 | 🧪 should work, very slow | 250 ms+ |
 
@@ -40,6 +40,10 @@ Not sure which graphics card you have? Press `Ctrl + Shift + Esc`, click **Perfo
 The name is in the top right corner.
 
 ## Installation
+
+### Step 0: Back up your game folder
+
+Copy your whole game folder somewhere safe (for example to your desktop). If something goes wrong, copy it back.
 
 ### Step 1: Download
 
@@ -69,6 +73,8 @@ If there is a `bin` or `Binaries\Win64` folder with the `.exe` inside, use that 
 ### Step 5: Run the setup
 
 In the game folder, double-click **`setup_windows.bat`**. A black window opens and asks some questions:
+
+> ⚠️ **Do you use ReShade or ENB?** Then **never** overwrite. If the script asks "overwrite?", answer `2` and pick `2` (`winmm.dll`). Overwriting deletes the ReShade/ENB file and the game may stop starting.
 
 | Question | Type |
 |---|---|
@@ -103,6 +109,7 @@ Open the file **`dlssnr_nr.log`** in the game folder with Notepad and look at th
 | `nvngx_dlssnr.dll missing or wrong version` | `nvngx_dlssnr.dll` is missing in the game folder, or it is a version with different weights. Get it again (step 2). |
 | `not an RDNA2 GPU` | Your graphics card is not supported (see "Does my PC work?"). |
 | `hipModuleLoad ...` | Your card could not load the program. Please report it in [Issues](../../issues) with the log. |
+| Game says a DirectX / d3d11 / dxgi file is missing | In Steam: right-click the game → Properties → Installed Files → **Verify integrity of game files**. If you use ReShade or ENB, reinstall it. |
 | No `dlssnr_nr.log` file at all | The mod did not load. Run `setup_windows.bat` again and check that you selected an upscaler in the game. |
 
 ## Uninstall

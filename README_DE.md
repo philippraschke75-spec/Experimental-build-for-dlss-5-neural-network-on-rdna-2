@@ -30,7 +30,7 @@ Du brauchst **alles** davon:
 | Grafikkarte | Status | Zeit pro Modell-Frame |
 |---|---|---|
 | RX 6800 / 6800 XT / 6900 XT / 6950 XT | ✅ getestet | ~40 ms |
-| RX 6700 / 6700 XT / 6750 XT | 🧪 sollte gehen, **ungetestet** (v0.2-beta) | ~80 ms (geschätzt) |
+| RX 6700 / 6700 XT / 6750 XT | 🧪 lädt, von einem User bestätigt (RX 6700 XT); Ergebnis im Spiel wird noch geprüft (v0.2-beta) | ~80 ms (geschätzt) |
 | RX 6600 / 6600 XT / 6650 XT | 🧪 sollte gehen, **ungetestet** (v0.2-beta) | ~110 ms (geschätzt) |
 | RX 6500 XT / 6400 | 🧪 sollte gehen, sehr langsam | 250 ms+ |
 
@@ -41,6 +41,10 @@ Du weißt nicht, welche Grafikkarte du hast? Drück `Strg + Umschalt + Esc`, kli
 auf **GPU**. Der Name steht oben rechts.
 
 ## Installation
+
+### Schritt 0: Spielordner vorher sichern
+
+Kopier deinen ganzen Spielordner an einen sicheren Ort (zum Beispiel auf den Desktop). Wenn etwas schiefgeht, kopierst du ihn zurück.
 
 ### Schritt 1: Herunterladen
 
@@ -70,6 +74,8 @@ Gibt es dort einen Ordner `bin` oder `Binaries\Win64` mit der `.exe` drin, nimm 
 ### Schritt 5: Setup starten
 
 Doppelklick im Spielordner auf **`setup_windows.bat`**. Ein schwarzes Fenster stellt ein paar Fragen:
+
+> ⚠️ **Du nutzt ReShade oder ENB?** Dann **niemals** überschreiben. Wenn das Skript „overwrite?“ fragt, antworte `2` und wähle `2` (`winmm.dll`). Überschreiben löscht die ReShade-/ENB-Datei, und das Spiel startet evtl. nicht mehr.
 
 | Frage | Eingabe |
 |---|---|
@@ -104,6 +110,7 @@ Der erste Start dauert ein paar Sekunden länger. Das ist normal.
 | `nvngx_dlssnr.dll missing or wrong version` | `nvngx_dlssnr.dll` fehlt im Spielordner oder hat andere Gewichte. Neu besorgen (Schritt 2). |
 | `not an RDNA2 GPU` | Deine Grafikkarte wird nicht unterstützt (siehe „Geht das auf meinem PC?“). |
 | `hipModuleLoad ...` | Deine Karte konnte das Programm nicht laden. Bitte in [Issues](../../issues) mit Log melden. |
+| Spiel meldet, eine DirectX- / d3d11- / dxgi-Datei fehlt | In Steam: Rechtsklick aufs Spiel → Eigenschaften → Installierte Dateien → **Dateien auf Fehler überprüfen**. Wenn du ReShade oder ENB nutzt, neu installieren. |
 | Es gibt gar keine `dlssnr_nr.log` | Die Mod wurde nicht geladen. `setup_windows.bat` nochmal ausführen und prüfen, ob im Spiel ein Upscaler an ist. |
 
 ## Deinstallieren
