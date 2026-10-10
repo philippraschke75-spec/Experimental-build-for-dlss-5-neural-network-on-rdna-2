@@ -188,7 +188,7 @@ struct Sync {                                       // D3D12 side of the sync pa
     ID3D12Resource *io = nullptr, *sig = nullptr, *st = nullptr; HANDLE hIo = nullptr, hSig = nullptr;
     UINT64 ioAlloc = 0, ioSize = 0, sigAlloc = 0, sigSize = 0, outOff = 0, flagOff = 0;
     ID3D12RootSignature* rs = nullptr; ID3D12PipelineState *imp = nullptr, *spin = nullptr, *exp = nullptr; ID3D12DescriptorHeap* heap = nullptr; UINT incr = 0;
-    unsigned seq = 0; unsigned busy = 0;
+    unsigned seq = 0; unsigned busy = 0; unsigned ran = 0;
 };
 struct Feature {
     unsigned W = 0, H = 0, pitch = 0;
@@ -411,7 +411,7 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
         auto* F = (Feature*)f; int n = ++g_evalCalls;
         if (!F || !cmd || !color || !out) return 0;
         if (F->state == S_FAILED) return 0;
-        if ((w != F->W || h != F->H) && F->state != S_SYNC) { if (!F->warnedSize) { F->warnedSize = true; logf("evaluate: size %ux%u != feature %ux%u, not running", w, h, F->W, F->H); } return 0; }
+        if ((w != F->W || h != F->H) && F->state != S_SYNC) { if (!F->warnedSize) { F->warnedSize = true; logf("evaluate: frame %ux%u, model %ux%u - native frame until the runtime has loaded", w, h, F->W, F->H); } return 0; }
         D3D12_RESOURCE_DESC cd = color->GetDesc(), od = out->GetDesc();
         if (!fmtOk(cd.Format) || !fmtOk(od.Format) || cd.Width < w || cd.Height < h || od.Width < w || od.Height < h) {
             if (!F->warnedFmt) { F->warnedFmt = true; logf("evaluate: unsupported color/output format %d/%d (%llux%u / %llux%u) - only RGBA16F / R11G11B10_FLOAT / RGBA8_UNORM", (int)cd.Format, (int)od.Format, cd.Width, cd.Height, od.Width, od.Height); } return 0; }
@@ -427,6 +427,7 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
             int q = p_extEnqueue(F->ctx, seq, g_maxInflight);       // HIP: wait flag_in >= seq, run, flag_out = seq (queued now, runs when the list below executes)
             if (q != 0) { if (s->busy++ < 5 || s->busy % 100 == 0) logf("sync: frame not queued (%s, %u so far) - native frame", q == 1 ? "HIP still busy with older frames" : "enqueue error", s->busy); if (q < 0) { seterr("nr_ext_enqueue failed (%d)", q); F->state = S_FAILED; } return 0; }
             s->seq = seq;
+            if (++s->ran <= 3 || s->ran % 1000 == 0) logf("sync: NR frame %u queued (frame %ux%u, %u native so far)", s->ran, w, h, s->busy);
             UINT k = (seq % kSyncRing) * 2; auto cpu = s->heap->GetCPUDescriptorHandleForHeapStart(); auto gpu = s->heap->GetGPUDescriptorHandleForHeapStart();
             D3D12_CPU_DESCRIPTOR_HANDLE c0 = cpu, c1 = cpu; c0.ptr += (SIZE_T)k * s->incr; c1.ptr += (SIZE_T)(k + 1) * s->incr; gpu.ptr += (UINT64)k * s->incr;
             D3D12_SHADER_RESOURCE_VIEW_DESC sv = {}; sv.Format = cd.Format; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
