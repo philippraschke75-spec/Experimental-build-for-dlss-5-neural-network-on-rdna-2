@@ -36,6 +36,7 @@ struct nr_ctx {
   // a CPU thread polls flag_in with a timeout and only then launches the frame.
   hipStream_t s = nullptr, ps = nullptr; uint32_t* hf = nullptr; std::thread th; std::condition_variable cv; std::deque<unsigned> q;
   std::atomic<bool> stop{false}; std::atomic<int> inflight{0};
+  std::vector<hipEvent_t> prof; std::vector<std::string> names;   // NR_PROF only
 };
 static const size_t kStrOff0 = 0x28, kStrOff1 = 0x48;
 static const size_t PAD = 1 << 16;
@@ -74,7 +75,8 @@ static bool upload_arena(nr_ctx* c) {   // pristine arena between two 0xA5 guard
 #ifdef _WIN32
   if (FILE* m = fopen((c->dir + "/weights.map").c_str(), "r")) {
     std::map<std::string, std::pair<const uint8_t*, uint64_t>> rec;
-    HMODULE dll = LoadLibraryExA((c->dir + "/../nvngx_dlssnr.dll").c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    HMODULE dll = nullptr;   // beside the data dir, or one level up (nr_data\<W>x<H>\ step dirs)
+    for (const char* up : {"/../", "/../../"}) if (!dll) dll = LoadLibraryExA((c->dir + up + "nvngx_dlssnr.dll").c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
     HRSRC r = dll ? FindResourceA(dll, "WEIGHTS_HT", MAKEINTRESOURCEA(10)) : nullptr;
     const uint8_t* b = r ? (const uint8_t*)LockResource(LoadResource(dll, r)) : nullptr; uint64_t sz = r ? SizeofResource(dll, r) : 0, o = 8;
     while (b && o + 8 <= sz) {
@@ -172,10 +174,11 @@ NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_ev
       const auto& k = st.ov ? st.src : st.ka; memcpy(&c->str[0], k.data() + kStrOff0, 8); memcpy(&c->str[2], k.data() + kStrOff1, 8);
       memcpy(c->pend, c->str, sizeof c->str);
     }
-    c->steps.push_back(std::move(st));
+    c->names.push_back(st.ov ? st.ov->sym : t[1]); c->steps.push_back(std::move(st));
   }
   fclose(f);
   HK(hipEventCreate(&c->e0)); HK(hipEventCreate(&c->e1));
+  if (getenv("NR_PROF")) { c->prof.resize(c->steps.size()); for (auto& e : c->prof) HK(hipEventCreate(&e)); }
   return c;
 }
 
@@ -208,6 +211,7 @@ static bool launch_all(nr_ctx* c, hipStream_t st) {         // the network's dis
     Step& s = c->steps[i]; size_t sz = s.ka.size();
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, s.ka.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     if (hipModuleLaunchKernel(s.fn, s.gx, s.gy, s.gz, s.thr, 1, 1, 0, st, nullptr, cfg) != hipSuccess) return false;
+    if (c->prof.size()) hipEventRecord(c->prof[i], st);
   }
   return true;
 }
@@ -223,6 +227,10 @@ NR_API int nr_run(nr_ctx* c, const void* in, void* out, float* gpu_ms) {
   hipEventRecord(c->e1);
   if (hipEventSynchronize(c->e1) != hipSuccess) return 3;   // ponytail: no timeout like net_run's SWIN_TIMEOUT; add if a hang matters
   if (gpu_ms) hipEventElapsedTime(gpu_ms, c->e0, c->e1);
+  if (c->prof.size() && c->frame == 5) {   // NR_PROF=1: per-dispatch GPU time of frame 5 to stderr (events between launches serialize nothing extra)
+    float t; hipEvent_t prev = c->e0;
+    for (size_t i = 0; i < c->steps.size(); i++) { hipEventElapsedTime(&t, prev, c->prof[i]); fprintf(stderr, "prof %3zu %.3f %s\n", i, t, c->names[i].c_str()); prev = c->prof[i]; }
+  }
   if (hipMemcpy(out, c->d + PAD + c->off_dst, c->dst_size, hipMemcpyDeviceToHost) != hipSuccess) return 4;
   c->frame++; return 0;
 }

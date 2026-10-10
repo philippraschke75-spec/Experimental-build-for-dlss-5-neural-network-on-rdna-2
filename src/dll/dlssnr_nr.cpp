@@ -13,7 +13,7 @@
 //                result -> output copy and return 1 (the result is stale by the network latency, ~10 frames at 60 fps).
 //   worker     : create the HIP runtime once (seconds), then per job: wait until the readback copy landed (sentinel
 //                polling, no queue access needed), run nr_run, publish the answer into an upload buffer.
-// ponytail: single feature/pass, RGBA16F only, model size fixed to the generated data dir; add RGBA8 + more sizes when needed.
+// ponytail: single feature/pass; model size = one step dir (nr_data\\WxH) picked at create, fixed until the host recreates.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
@@ -34,14 +34,14 @@
 // ---------------------------------------------------------------- logging / settings
 static CRITICAL_SECTION g_cs; static FILE* g_log; static char g_err[512] = "";
 static std::wstring g_dir;                         // folder of this DLL
-static std::string g_dataDir, g_logName = "dlssnr_nr.log"; static int g_vitEvery = 1, g_settleMs = 20, g_jobTimeoutMs = 3000;
+static std::string g_dataDir, g_modelRes = "auto", g_logName = "dlssnr_nr.log"; static int g_vitEvery = 1, g_settleMs = 20, g_jobTimeoutMs = 3000;
 static std::atomic<int> g_evalCalls{0};
 static float g_intensity = -1.0f;                       // nr_set_intensity 0..2 (runtime strength of the network); <0 = keep the strength baked into the data dir
 static float curIntensity() { return g_intensity; }
 static std::atomic<bool> g_exiting{false};              // set by atexit: at process exit never join/destroy anything (leak it, the OS reclaims)
 static struct ExitHook { ExitHook() { atexit([] { g_exiting = true; }); } } g_exitHook;
 static int g_apply = 1, g_gate = 1; static float g_gain = 1.0f, g_gateLo = 0.03f, g_gateHi = 0.15f;   // apply=1: out = current frame + gain * (NR(old frame) - old frame) (no lag); apply=0: copy the finished (stale) NR image
-static int g_sync = 1, g_spinMs = 250, g_maxInflight = 3;   // sync=1: same-frame NR through D3D12<->HIP shared memory (see DESIGN.md); falls back to the async path when unavailable
+static int g_sync = 1, g_spinMs = 250, g_maxInflight = 3, g_fg = 1, g_fgWaitMs = 4, g_fgMaxAge = 3;   // sync=1: same-frame NR through D3D12<->HIP shared memory (see DESIGN.md); falls back to the async path when unavailable
 
 static void logf(const char* fmt, ...) {
     EnterCriticalSection(&g_cs);
@@ -55,6 +55,7 @@ static void loadSettings() {
     std::wstring ini = g_dir + L"nr_port.ini"; char b[1024];
     GetPrivateProfileStringA("nr", "data_dir", "nr_data", b, sizeof b, narrow(ini).c_str()); g_dataDir = b;
     if (g_dataDir.size() < 2 || (g_dataDir[1] != ':' && g_dataDir[0] != '\\' && g_dataDir[0] != '/')) g_dataDir = narrow(g_dir) + g_dataDir;   // relative -> next to the DLL
+    GetPrivateProfileStringA("nr", "model_res", "auto", b, sizeof b, narrow(ini).c_str()); g_modelRes = b;   // WxH (a subfolder of data_dir) or auto
     GetPrivateProfileStringA("nr", "log", "dlssnr_nr.log", b, sizeof b, narrow(ini).c_str()); g_logName = b;
     g_vitEvery = (int)GetPrivateProfileIntA("nr", "vit_every", 1, narrow(ini).c_str());
     g_settleMs = (int)GetPrivateProfileIntA("nr", "settle_ms", 20, narrow(ini).c_str());
@@ -67,7 +68,10 @@ static void loadSettings() {
     GetPrivateProfileStringA("nr", "intensity", "-1", b, sizeof b, narrow(ini).c_str()); g_intensity = (float)atof(b); if (!(g_intensity >= 0.f)) g_intensity = -1.f; if (g_intensity > 2.f) g_intensity = 2.f;
     g_sync = (int)GetPrivateProfileIntA("nr", "sync", 1, narrow(ini).c_str());
     g_spinMs = (int)GetPrivateProfileIntA("nr", "sync_timeout_ms", 250, narrow(ini).c_str()); g_spinMs = g_spinMs < 10 ? 10 : g_spinMs > 1000 ? 1000 : g_spinMs;   // GPU wait bound, far below the 2 s TDR
-    g_maxInflight = (int)GetPrivateProfileIntA("nr", "max_inflight", 3, narrow(ini).c_str()); g_maxInflight = g_maxInflight < 1 ? 1 : g_maxInflight > 8 ? 8 : g_maxInflight;
+    g_fg = (int)GetPrivateProfileIntA("nr", "fg_mode", 1, narrow(ini).c_str());   // 1: frame-generation friendly sync (never native once an NR result exists; short bounded queue wait)
+    g_fgWaitMs = (int)GetPrivateProfileIntA("nr", "fg_wait_ms", 4, narrow(ini).c_str()); g_fgWaitMs = g_fgWaitMs < 0 ? 0 : g_fgWaitMs > 1000 ? 1000 : g_fgWaitMs;
+    g_fgMaxAge = (int)GetPrivateProfileIntA("nr", "fg_max_age", 3, narrow(ini).c_str()); g_fgMaxAge = g_fgMaxAge < 0 ? 0 : g_fgMaxAge > 60 ? 60 : g_fgMaxAge;   // fg: reuse an NR edit at most this many frames, fading out
+    g_maxInflight = (int)GetPrivateProfileIntA("nr", "max_inflight", g_fg ? 1 : 3, narrow(ini).c_str()); g_maxInflight = g_maxInflight < 1 ? 1 : g_maxInflight > 8 ? 8 : g_maxInflight;
     auto cl = [](float v, float lo, float hi) { return v != v ? lo : v < lo ? lo : v > hi ? hi : v; };   // ini garbage (NaN, huge, negative) never reaches the GPU constants
     g_gain = cl(g_gain, 0.f, 2.f); g_gateLo = cl(g_gateLo, 0.f, 1.f); g_gateHi = cl(g_gateHi, g_gateLo, 1.f);
     g_settleMs = g_settleMs < 0 ? 0 : g_settleMs > 500 ? 500 : g_settleMs; g_jobTimeoutMs = g_jobTimeoutMs < 200 ? 200 : g_jobTimeoutMs > 60000 ? 60000 : g_jobTimeoutMs; if (g_vitEvery < 1) g_vitEvery = 1;
@@ -148,7 +152,19 @@ static const char* kSyncHlsl =
 "RWTexture2D<float4> outp : register(u0);\n"
 "globallycoherent RWByteAddressBuffer io : register(u1);\n"
 "globallycoherent RWByteAddressBuffer st : register(u2);\n"
-"cbuffer C : register(b0) { uint W; uint H; uint seq; uint maxIt; uint outOff; uint flagOff; float gain; uint FWH; };\n"   // W,H model; FWH = frame W | H << 16
+"cbuffer C : register(b0) { uint W; uint H; uint seq; uint maxIt; uint outOff; uint flagOff; float gain; uint FWH; uint minSeq; float gLo; float gHi; uint gate; uint frame; uint maxAge; };\n"   // minSeq != 0: fg mode, reuse the edit captured from a frame >= minSeq;   // W,H model; FWH = frame W | H << 16
+"RWByteAddressBuffer ob : register(u3);\n"   // PACKED: frame-size R9G9B9E5 staging, copied into the output texture afterwards
+"uint e5(float3 c) {\n"   // float3 -> R9G9B9E5_SHAREDEXP (N=9, B=15)
+"  c = clamp(c, 0.0, 65408.0); float m = max(c.r, max(c.g, c.b)); int e = max(-16, (int)floor(log2(max(m, 1e-30)))) + 16;\n"
+"  float d = exp2(e - 24); if (floor(m / d + 0.5) >= 512.0) { d *= 2.0; e++; } uint3 q = (uint3)floor(c / d + 0.5);\n"
+"  return q.r | (q.g << 9) | (q.b << 18) | ((uint)e << 27); }\n"
+"void put(uint2 p, float4 v) {\n"
+"#ifdef PACKED\n"
+"  ob.Store(p.y * ((((FWH & 0xFFFF) * 4) + 255) & ~255) + p.x * 4, e5(v.rgb));\n"
+"#else\n"
+"  outp[p] = v;\n"
+"#endif\n"
+"}\n"   // W,H model; FWH = frame W | H << 16
 "float san(float v) { return (v != v || v < -65504.0) ? 0.0 : min(v, 65504.0); }\n"   // NaN/-Inf -> 0, +Inf -> 65504 (as the CPU path)
 "uint pk(float a, float b) { return f32tof16(san(a)) | (f32tof16(san(b)) << 16); }\n"
 "float4 bil(float2 p, uint off) {\n"   // bilinear fetch of a half4 model-size image in io at model coords p (pixel centres at .5)
@@ -170,16 +186,30 @@ static const char* kSyncHlsl =
 "[numthreads(1,1,1)] void spin() {\n"
 "  uint v = 0; for (uint i = 0; i < maxIt; i++) { io.InterlockedOr(flagOff, 0, v); if ((int)(v - seq) >= 0) break; }\n"
 "  st.Store(0, (int)(v - seq) >= 0 ? 1u : 0u); }\n"
+"[numthreads(8,8,1)] void cap(uint3 id : SV_DispatchThreadID) {\n"   // fg: keep the NR edit (out - in, model size) of a finished frame at st+256
+"  if (id.x >= W || id.y >= H || st.Load(0) == 0) return; uint o = (id.y * W + id.x) * 8;\n"
+"  float4 i = bil(id.xy + 0.5, 0), d = sn(bil(id.xy + 0.5, outOff) - i); st.Store2(256 + o, uint2(pk(d.r, d.g), pk(d.b, 0)));\n"
+"  st.Store2(256 + W * H * 8 + o, uint2(pk(i.r, i.g), pk(i.b, 0)));\n"   // + the model input the edit belongs to (motion gate)
+"  if (id.x == 0 && id.y == 0) { st.Store(4, seq); st.Store(8, frame); } }\n"
 "[numthreads(8,8,1)] void exp(uint3 id : SV_DispatchThreadID) {\n"
 "  uint FW = FWH & 0xFFFF, FH = FWH >> 16; if (id.x >= FW || id.y >= FH) return; float4 c = col[id.xy];\n"
-"  if (st.Load(0) == 0) { outp[id.xy] = c; return; }\n"
+"  if (st.Load(0) == 0) {\n"
+"    uint age = frame - st.Load(8);\n"   // fg: frames since the edit's own frame; older than maxAge -> live frame only
+"    if (minSeq != 0 && (int)(st.Load(4) - minSeq) >= 0 && age <= maxAge) { float2 p = (id.xy + 0.5) * float2(W, H) / float2(FW, FH);\n"   // fg: live frame + last NR edit
+"      p = clamp(p - 0.5, 0.0, float2(W - 1, H - 1)); uint2 a = (uint2)p; uint2 b = min(a + 1, uint2(W - 1, H - 1)); float2 t = p - a; float3 e[4]; uint2 ix[4] = { a, uint2(b.x, a.y), uint2(a.x, b.y), b };\n"
+"      for (int i = 0; i < 4; i++) { uint2 q = st.Load2(256 + (ix[i].y * W + ix[i].x) * 8); e[i] = float3(f16tof32(q.x & 0xFFFF), f16tof32(q.x >> 16), f16tof32(q.y & 0xFFFF));\n"
+"        if (gate) { uint2 u = st.Load2(256 + W * H * 8 + (ix[i].y * W + ix[i].x) * 8); float3 o = float3(f16tof32(u.x & 0xFFFF), f16tof32(u.x >> 16), f16tof32(u.y & 0xFFFF));\n"   // motion gate per model pixel: live colour (sampled as imp does) vs the edit's input
+"          float3 l = ((FW == W && FH == H) ? sn(col[ix[i]]) : colAt((ix[i] + 0.5) * float2(FW, FH) / float2(W, H))).rgb; float3 a = abs(l - o);\n"
+"          e[i] *= 1.0 - smoothstep(gLo, gHi, max(a.r, max(a.g, a.b))); } }\n"
+"      float3 d = lerp(lerp(e[0], e[1], t.x), lerp(e[2], e[3], t.x), t.y) * (1.0 - (float)age / (maxAge + 1)); put(id.xy, float4(max(c.rgb + gain * d, 0.0), c.a)); return; }\n"
+"    put(id.xy, c); return; }\n"
 "  if (FW != W || FH != H) {\n"     // resampled: carry the model's change (out - in, model size) up to the frame
 "    float2 p = (id.xy + 0.5) * float2(W, H) / float2(FW, FH); float4 d = sn(bil(p, outOff) - bil(p, 0));\n"
-"    outp[id.xy] = float4(max(c.rgb + gain * d.rgb, 0.0), c.a); return; }\n"                       // timeout: native frame
+"    put(id.xy, float4(max(c.rgb + gain * d.rgb, 0.0), c.a)); return; }\n"                       // timeout: native frame
 "  uint2 r = io.Load2(outOff + (id.y * W + id.x) * 8);\n"
 "  float3 e = float3(san(f16tof32(r.x & 0xFFFF)), san(f16tof32(r.x >> 16)), san(f16tof32(r.y & 0xFFFF)));\n"
 "  float3 o = gain == 1.0 ? e : c.rgb + gain * (e - c.rgb);\n"
-"  outp[id.xy] = float4(max(o, 0.0), c.a); }\n";
+"  put(id.xy, float4(max(o, 0.0), c.a)); }\n";
 static const int kSyncRing = 16;                                       // descriptor pairs (colour SRV, output UAV) in flight
 
 // ---------------------------------------------------------------- feature
@@ -187,14 +217,14 @@ enum { S_LOADING = 0, S_IDLE = 1, S_WAIT_COPY = 2, S_RUNNING = 3, S_FAILED = 4, 
 struct Sync {                                       // D3D12 side of the sync path; HIP imports io + sig
     ID3D12Resource *io = nullptr, *sig = nullptr, *st = nullptr; HANDLE hIo = nullptr, hSig = nullptr;
     UINT64 ioAlloc = 0, ioSize = 0, sigAlloc = 0, sigSize = 0, outOff = 0, flagOff = 0;
-    ID3D12RootSignature* rs = nullptr; ID3D12PipelineState *imp = nullptr, *spin = nullptr, *exp = nullptr; ID3D12DescriptorHeap* heap = nullptr; UINT incr = 0;
-    unsigned seq = 0; unsigned busy = 0; unsigned ran = 0;
+    ID3D12RootSignature* rs = nullptr; ID3D12PipelineState *imp = nullptr, *spin = nullptr, *exp = nullptr, *cap = nullptr, *expPk = nullptr; ID3D12Resource* ob = nullptr; unsigned obW = 0, obH = 0; ID3D12DescriptorHeap* heap = nullptr; UINT incr = 0;
+    unsigned seq = 0; unsigned busy = 0; unsigned ran = 0, rec = 0, reused = 0, minSeq = 1; unsigned frm = 0, frmOf[16] = {};   // fg: frame counter, frame of each in-flight seq (edit age)
 };
 struct Feature {
     unsigned W = 0, H = 0, pitch = 0;
     ID3D12Resource* rb = nullptr; ID3D12Resource* up[2] = {}; uint8_t* rbp = nullptr; uint8_t* upp[2] = {};
     std::atomic<int> state{S_LOADING}; std::atomic<int> published{-1}; std::atomic<bool> quit{false};
-    std::thread th; nr_ctx* ctx = nullptr; DWORD jobStart = 0; bool warnedFmt = false, warnedSize = false;
+    std::thread th; std::string dir; nr_ctx* ctx = nullptr; DWORD jobStart = 0; bool warnedFmt = false, warnedSize = false;
     std::atomic<unsigned> resetGen{0}, slotEval[2] = {{0}, {0}}; unsigned jobGen = 0; float appliedIntensity = -2.f;   // resetGen: bumped by a real reset; slotEval: last evaluate that recorded a read of a slot
     std::vector<uint8_t> tin, tout;
     ID3D12Device* dev = nullptr; ID3D12RootSignature* rs = nullptr; ID3D12PipelineState* pso = nullptr; ID3D12DescriptorHeap* heap = nullptr; UINT incr = 0; bool delta = false;
@@ -245,9 +275,9 @@ static void worker(Feature* F) {
     try {
         char err[512] = {0};
         if (!loadRuntime()) { F->state = S_FAILED; return; }
-        logf("worker: nr_create(%s, %ux%u, vit_every %d)...", g_dataDir.c_str(), F->W, F->H, g_vitEvery);
+        logf("worker: nr_create(%s, %ux%u, vit_every %d)...", F->dir.c_str(), F->W, F->H, g_vitEvery);
         DWORD t0 = GetTickCount();
-        F->ctx = safeCreate(g_dataDir.c_str(), (int)F->W, (int)F->H, g_vitEvery, err, sizeof err);
+        F->ctx = safeCreate(F->dir.c_str(), (int)F->W, (int)F->H, g_vitEvery, err, sizeof err);
         if (!F->ctx) { seterr("nr_create failed: %s", err); F->state = S_FAILED; return; }
         if (F->quit) { if (p_destroy) p_destroy(F->ctx); F->ctx = nullptr; return; }   // released while the runtime was loading: clean up and leave
         logf("worker: runtime ready after %lu ms", GetTickCount() - t0);
@@ -315,7 +345,7 @@ static bool makeDelta(Feature* F) {
 
 static void freeSync(Sync* s) {
     if (!s) return;
-    for (IUnknown* u : std::initializer_list<IUnknown*>{s->io, s->sig, s->st, s->rs, s->imp, s->spin, s->exp, s->heap}) if (u) u->Release();
+    for (IUnknown* u : std::initializer_list<IUnknown*>{s->io, s->sig, s->st, s->rs, s->imp, s->spin, s->exp, s->cap, s->expPk, s->ob, s->heap}) if (u) u->Release();
     if (s->hIo) CloseHandle(s->hIo); if (s->hSig) CloseHandle(s->hSig); delete s;
 }
 static ID3D12Resource* sharedBuffer(ID3D12Device* d, UINT64 size, D3D12_HEAP_FLAGS hf, UINT64* alloc) {
@@ -333,20 +363,21 @@ static Sync* makeSync(Feature* F) {
     auto* s = new Sync; ID3D12Device* d = F->dev;
     const UINT64 n = (UINT64)F->W * F->H * 8, a = (n + 65535) & ~65535ull;
     s->outOff = a; s->flagOff = 2 * a; s->ioSize = 2 * a + 65536; s->sigSize = 65536;
-    s->io = sharedBuffer(d, s->ioSize, D3D12_HEAP_FLAG_SHARED, &s->ioAlloc); s->sig = sharedBuffer(d, s->sigSize, D3D12_HEAP_FLAG_SHARED, &s->sigAlloc); s->st = sharedBuffer(d, 256, D3D12_HEAP_FLAG_NONE, nullptr);
+    s->io = sharedBuffer(d, s->ioSize, D3D12_HEAP_FLAG_SHARED, &s->ioAlloc); s->sig = sharedBuffer(d, s->sigSize, D3D12_HEAP_FLAG_SHARED, &s->sigAlloc); s->st = sharedBuffer(d, 256 + 2 * n, D3D12_HEAP_FLAG_NONE, nullptr);   // status words | fg edit | its model input (half4, model size each)
     if (!s->io || !s->sig || !s->st) { logf("sync: cannot create shared buffers"); freeSync(s); return nullptr; }
     if (FAILED(d->CreateSharedHandle(s->io, nullptr, GENERIC_ALL, nullptr, &s->hIo)) || FAILED(d->CreateSharedHandle(s->sig, nullptr, GENERIC_ALL, nullptr, &s->hSig))) { logf("sync: CreateSharedHandle failed"); freeSync(s); return nullptr; }
     D3D12_DESCRIPTOR_RANGE rg[2] = {}; rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 1; rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rg[1].NumDescriptors = 1; rg[1].OffsetInDescriptorsFromTableStart = 1;
-    D3D12_ROOT_PARAMETER rp[4] = {}; rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[0].DescriptorTable.NumDescriptorRanges = 2; rp[0].DescriptorTable.pDescriptorRanges = rg;
+    D3D12_ROOT_PARAMETER rp[5] = {}; rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[0].DescriptorTable.NumDescriptorRanges = 2; rp[0].DescriptorTable.pDescriptorRanges = rg;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[1].Descriptor.ShaderRegister = 1; rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[2].Descriptor.ShaderRegister = 2;
-    rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[3].Constants.Num32BitValues = 8;
-    D3D12_ROOT_SIGNATURE_DESC rsd = {}; rsd.NumParameters = 4; rsd.pParameters = rp; ID3DBlob *sb = nullptr, *er = nullptr;
+    rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[3].Constants.Num32BitValues = 14; rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[4].Descriptor.ShaderRegister = 3;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {}; rsd.NumParameters = 5; rsd.pParameters = rp; ID3DBlob *sb = nullptr, *er = nullptr;
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sb, &er)) || FAILED(d->CreateRootSignature(0, sb->GetBufferPointer(), sb->GetBufferSize(), IID_PPV_ARGS(&s->rs)))) { logf("sync: root signature failed"); freeSync(s); return nullptr; }
     sb->Release();
-    ID3D12PipelineState** pso[3] = {&s->imp, &s->spin, &s->exp}; const char* ep[3] = {"imp", "spin", "exp"};
-    for (int i = 0; i < 3; i++) {
+    ID3D12PipelineState** pso[5] = {&s->imp, &s->spin, &s->exp, &s->cap, &s->expPk}; const char* ep[5] = {"imp", "spin", "exp", "cap", "exp"};
+    const char* pk[4] = {"PACKED", "1", nullptr, nullptr};   // D3D_SHADER_MACRO[2], for expPk
+    for (int i = 0; i < 5; i++) {
         ID3DBlob* cs = nullptr; er = nullptr;
-        if (FAILED(comp(kSyncHlsl, strlen(kSyncHlsl), "nr_sync", nullptr, nullptr, ep[i], "cs_5_0", 1 << 15, 0, &cs, &er))) { logf("sync: shader %s: %s", ep[i], er ? (char*)er->GetBufferPointer() : "?"); freeSync(s); return nullptr; }
+        if (FAILED(comp(kSyncHlsl, strlen(kSyncHlsl), "nr_sync", i == 4 ? pk : nullptr, nullptr, ep[i], "cs_5_0", 1 << 15, 0, &cs, &er))) { logf("sync: shader %s: %s", ep[i], er ? (char*)er->GetBufferPointer() : "?"); freeSync(s); return nullptr; }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {}; pd.pRootSignature = s->rs; pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
         HRESULT h = d->CreateComputePipelineState(&pd, IID_PPV_ARGS(pso[i])); cs->Release(); if (FAILED(h)) { logf("sync: PSO %s failed", ep[i]); freeSync(s); return nullptr; }
     }
@@ -356,9 +387,31 @@ static Sync* makeSync(Feature* F) {
     return s;
 }
 
+// Model resolution step: data_dir holds one subfolder per step (640x360, 960x540, 1280x720, ...), or is itself one
+// data dir (legacy). nr_port.ini model_res=WxH picks a step; auto (default) takes the step nearest in height to the size
+// the host creates the feature with (OptiScaler's Model resolution slider sets that size; a change recreates the feature).
+static bool readMeta(const std::string& dir, unsigned* w, unsigned* h);
+static std::string pickModelDir(unsigned w, unsigned h) {
+    unsigned mw, mh; if (readMeta(g_dataDir, &mw, &mh)) return g_dataDir;
+    std::vector<std::pair<unsigned, unsigned>> st; WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA((g_dataDir + "\\*x*").c_str(), &fd);
+    if (fh != INVALID_HANDLE_VALUE) { do { unsigned a, b; if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && sscanf_s(fd.cFileName, "%ux%u", &a, &b) == 2) st.push_back({a, b}); } while (FindNextFileA(fh, &fd)); FindClose(fh); }
+    auto name = [](unsigned a, unsigned b) { char n[32]; snprintf(n, sizeof n, "%ux%u", a, b); return std::string(n); };
+    if (st.empty()) return g_dataDir;   // create reports the missing meta.txt
+    std::string want = g_modelRes;
+    if (want != "auto" && std::none_of(st.begin(), st.end(), [&](const std::pair<unsigned, unsigned>& p) { return name(p.first, p.second) == want; })) { logf("model_res %s: no such step in %s, using auto", want.c_str(), g_dataDir.c_str()); want = "auto"; }
+    if (want == "auto" && !st.empty()) {
+        auto best = std::make_pair(1280u, 720u); bool def = std::find(st.begin(), st.end(), best) != st.end(); if (!def) best = st[0];
+        if (h) for (auto& p : st) if (abs((int)p.second - (int)h) < abs((int)best.second - (int)h)) best = p;   // ties keep 1280x720
+        want = name(best.first, best.second);
+    }
+    std::string steps; for (auto& p : st) steps += " " + name(p.first, p.second);
+    logf("model resolution: %s (model_res=%s, host size %ux%u, steps:%s)", want.c_str(), g_modelRes.c_str(), w, h, steps.c_str());
+    return g_dataDir + "\\" + want;
+}
+
 // ---------------------------------------------------------------- exports
-static bool readMeta(unsigned* w, unsigned* h) {
-    std::string p = g_dataDir + "\\meta.txt"; FILE* f = nullptr; fopen_s(&f, p.c_str(), "r"); if (!f) return false;
+static bool readMeta(const std::string& dir, unsigned* w, unsigned* h) {
+    std::string p = dir + "\\meta.txt"; FILE* f = nullptr; fopen_s(&f, p.c_str(), "r"); if (!f) return false;
     char line[256]; *w = *h = 0;
     while (fgets(line, sizeof line, f)) { unsigned v; if (sscanf_s(line, "width=%u", &v) == 1) *w = v; if (sscanf_s(line, "height=%u", &v) == 1) *h = v; }
     fclose(f); return *w && *h;
@@ -370,6 +423,7 @@ __declspec(dllexport) int dlssnr_last_ratio_result = 0, dlssnr_last_ratio_stage 
 __declspec(dllexport) const char* dlssnr_backend_id() { return "rdna2-hip"; }   // presence marks the "port" flavour
 __declspec(dllexport) const char* dlssnr_call_error() { return g_err; }
 __declspec(dllexport) int dlssnr_port_state(void* f) { return f ? ((Feature*)f)->state.load() : -1; }   // diagnostics/tests: 0 loading, 1-3 async, 4 failed, 5 sync
+__declspec(dllexport) void dlssnr_port_stats(void* f, unsigned* nr, unsigned* native, unsigned* reused) { Sync* s = f ? ((Feature*)f)->sy : nullptr; *nr = s ? s->ran : 0; *native = s ? s->busy : 0; *reused = s ? s->reused : 0; }   // tests: sync-path frame counts
 __declspec(dllexport) void dlssnr_call_set_float_slot(int) {}
 __declspec(dllexport) void dlssnr_call_probe_float(void*, const char*, float, int) {}
 __declspec(dllexport) void dlssnr_call_set_extras(void*, float, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, unsigned, unsigned, unsigned, unsigned) {}
@@ -381,11 +435,11 @@ __declspec(dllexport) void* dlssnr_call_create(const wchar_t* snippet, const wch
         logf("create: snippet=%ls dev=%p %ux%u", snippet ? snippet : L"", (void*)dev, w, h);
         dlssnr_call_last_create = 0;
         if (!dev) { seterr("create: no D3D12 device"); return nullptr; }
-        unsigned mw = 0, mh = 0;
-        if (!readMeta(&mw, &mh)) { seterr("create: no meta.txt in data_dir '%s' (run gen_runtime_data.py, see INSTALL.md)", g_dataDir.c_str()); return nullptr; }
+        unsigned mw = 0, mh = 0; const std::string dir = pickModelDir(w, h);
+        if (!readMeta(dir, &mw, &mh)) { seterr("create: no meta.txt in '%s' (run gen_runtime_data.py, see INSTALL.md)", dir.c_str()); return nullptr; }
         if ((mw != w || mh != h) && g_sync) { logf("create: frame %ux%u, model %ux%u - sync path resamples (universal for any resolution / upscaler mode)", w, h, mw, mh); w = mw; h = mh; }
-        if (mw != w || mh != h) { seterr("create: model size %ux%u but data dir '%s' is for %ux%u - generate data for this size", w, h, g_dataDir.c_str(), mw, mh); return nullptr; }
-        auto* F = new Feature; F->W = w; F->H = h; F->pitch = align256(w * 8);
+        if (mw != w || mh != h) { seterr("create: model size %ux%u but data dir '%s' is for %ux%u - generate data for this size", w, h, dir.c_str(), mw, mh); return nullptr; }
+        auto* F = new Feature; F->dir = dir; F->W = w; F->H = h; F->pitch = align256(w * 8);
         F->tin.resize((size_t)w * h * 8); F->tout.resize((size_t)w * h * 8);
         UINT64 sz = (UINT64)F->pitch * h;
         F->rb = makeBuffer(dev, D3D12_HEAP_TYPE_READBACK, sz, &F->rbp);
@@ -413,7 +467,13 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
         if (F->state == S_FAILED) return 0;
         if ((w != F->W || h != F->H) && F->state != S_SYNC) { if (!F->warnedSize) { F->warnedSize = true; logf("evaluate: frame %ux%u, model %ux%u - native frame until the runtime has loaded", w, h, F->W, F->H); } return 0; }
         D3D12_RESOURCE_DESC cd = color->GetDesc(), od = out->GetDesc();
-        if (!fmtOk(cd.Format) || !fmtOk(od.Format) || cd.Width < w || cd.Height < h || od.Width < w || od.Height < h) {
+        // R9G9B9E5 output (RE Engine): sync path only, packed in a shader and copied in. Only when the host created the texture
+        // with ALLOW_UNORDERED_ACCESS: then it is in the UAV state (OptiScaler-DLSSNR contract) and our UAV<->COPY_DEST barriers
+        // are legal. Without the flag a UAV-state barrier removes the device, so that case stays native.
+        const bool e5 = F->state == S_SYNC && od.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && (od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (F->state == S_SYNC && od.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && !e5) {
+            if (!F->warnedFmt) { F->warnedFmt = true; logf("evaluate: R9G9B9E5 output without UAV flag (%llux%u) - native frame; try NR before super resolution", od.Width, od.Height); } return 0; }
+        if (!(fmtOk(cd.Format) || (F->state == S_SYNC && cd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) || !(fmtOk(od.Format) || e5) || cd.Width < w || cd.Height < h || od.Width < w || od.Height < h) {
             if (!F->warnedFmt) { F->warnedFmt = true; logf("evaluate: unsupported color/output format %d/%d (%llux%u / %llux%u) - only RGBA16F / R11G11B10_FLOAT / RGBA8_UNORM", (int)cd.Format, (int)od.Format, cd.Width, cd.Height, od.Width, od.Height); } return 0; }
         F->inFmt = (int)cd.Format; F->outFmt = (int)od.Format;
         if (reset == 1) { F->published = -1; F->resetGen++; }      // a real reset (first frame, resolution change, camera cut): no edit from before it survives. Only exactly 1 counts.
@@ -423,21 +483,35 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
             Sync* s = F->sy; ID3D12GraphicsCommandList2* c2 = nullptr;
             if (FAILED(cmd->QueryInterface(IID_PPV_ARGS(&c2)))) { if (!s->busy++) logf("sync: host list has no WriteBufferImmediate (ID3D12GraphicsCommandList2) - native frame"); return 0; }
             c2->Release();                                          // the host holds the list; we only need the interface for this call
-            const unsigned seq = s->seq + 1;
+            if (reset == 1) s->minSeq = s->seq + 1;                 // fg: no edit from before a camera cut is reused
+            const unsigned seq = s->seq + 1; ++s->frm;
             int q = p_extEnqueue(F->ctx, seq, g_maxInflight);       // HIP: wait flag_in >= seq, run, flag_out = seq (queued now, runs when the list below executes)
-            if (q != 0) { if (s->busy++ < 5 || s->busy % 100 == 0) logf("sync: frame not queued (%s, %u so far) - native frame", q == 1 ? "HIP still busy with older frames" : "enqueue error", s->busy); if (q < 0) { seterr("nr_ext_enqueue failed (%d)", q); F->state = S_FAILED; } return 0; }
-            s->seq = seq;
-            if (++s->ran <= 3 || s->ran % 1000 == 0) logf("sync: NR frame %u queued (frame %ux%u, %u native so far)", s->ran, w, h, s->busy);
-            UINT k = (seq % kSyncRing) * 2; auto cpu = s->heap->GetCPUDescriptorHandleForHeapStart(); auto gpu = s->heap->GetGPUDescriptorHandleForHeapStart();
+            if (q < 0) { seterr("nr_ext_enqueue failed (%d)", q); F->state = S_FAILED; return 0; }
+            if (q != 0 && !g_fg) { if (s->busy++ < 5 || s->busy % 100 == 0) logf("sync: frame not queued (HIP still busy with older frames, %u so far) - native frame", s->busy); return 0; }
+            if (q == 0) { s->seq = seq; s->frmOf[seq % 16] = s->frm; if (++s->ran <= 3 || s->ran % 1000 == 0) logf("sync: NR frame %u queued (frame %ux%u, %u native, %u reused so far)", s->ran, w, h, s->busy, s->reused); }
+            else s->reused++;                                       // fg: HIP busy -> live frame + last NR edit, the queue does not wait
+            UINT k = (++s->rec % kSyncRing) * 2; auto cpu = s->heap->GetCPUDescriptorHandleForHeapStart(); auto gpu = s->heap->GetGPUDescriptorHandleForHeapStart();
             D3D12_CPU_DESCRIPTOR_HANDLE c0 = cpu, c1 = cpu; c0.ptr += (SIZE_T)k * s->incr; c1.ptr += (SIZE_T)(k + 1) * s->incr; gpu.ptr += (UINT64)k * s->incr;
             D3D12_SHADER_RESOURCE_VIEW_DESC sv = {}; sv.Format = cd.Format; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
             F->dev->CreateShaderResourceView(color, &sv, c0);
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.Format = od.Format; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; F->dev->CreateUnorderedAccessView(out, nullptr, &uv, c1);
-            UINT cb[8] = { F->W, F->H, seq, (UINT)g_spinMs * 6000u /* ~0.16 us per poll on a 6900 XT */, (UINT)s->outOff, (UINT)s->flagOff, 0, w | (h << 16) }; float gain = g_gain; memcpy(&cb[6], &gain, 4);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.Format = e5 ? DXGI_FORMAT_R16G16B16A16_FLOAT : od.Format; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; F->dev->CreateUnorderedAccessView(e5 ? nullptr : out, nullptr, &uv, c1);   // e5: null UAV, output goes through ob
+            UINT cb[14] = { F->W, F->H, seq, (UINT)(g_fg ? g_fgWaitMs : g_spinMs) * 6000u /* ~0.16 us per poll on a 6900 XT */, (UINT)s->outOff, (UINT)s->flagOff, 0, w | (h << 16), g_fg ? s->minSeq : 0u, 0, 0, (UINT)g_gate, s->frm, (UINT)g_fgMaxAge };
+            float gain = g_gain; memcpy(&cb[6], &gain, 4); memcpy(&cb[9], &g_gateLo, 4); memcpy(&cb[10], &g_gateHi, 4);   // gLo, gHi
             ID3D12DescriptorHeap* hp[] = { s->heap }; cmd->SetDescriptorHeaps(1, hp); cmd->SetComputeRootSignature(s->rs);
             cmd->SetComputeRootDescriptorTable(0, gpu); cmd->SetComputeRootUnorderedAccessView(1, s->io->GetGPUVirtualAddress()); cmd->SetComputeRootUnorderedAccessView(2, s->st->GetGPUVirtualAddress());
-            cmd->SetComputeRoot32BitConstants(3, 8, cb, 0);
             D3D12_RESOURCE_BARRIER uav = {}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;   // null resource = all UAV writes
+            if (g_fg && s->seq > (q == 0 ? 1u : 0u)) {              // fg: harvest the newest earlier frame if HIP finished it after its own (short) wait
+                UINT hb[14]; memcpy(hb, cb, sizeof hb); hb[2] = q == 0 ? seq - 1 : s->seq; hb[3] = 1; hb[12] = s->frmOf[hb[2] % 16]; cmd->SetComputeRoot32BitConstants(3, 14, hb, 0);
+                cmd->SetPipelineState(s->spin); cmd->Dispatch(1, 1, 1); cmd->ResourceBarrier(1, &uav);
+                cmd->SetPipelineState(s->cap); cmd->Dispatch((F->W + 7) / 8, (F->H + 7) / 8, 1); cmd->ResourceBarrier(1, &uav);
+            }
+            cmd->SetComputeRoot32BitConstants(3, 14, cb, 0);
+            if (q != 0) {                                           // fg, HIP busy: st[0] = 0 forces the reuse/native branch of exp
+                cb[3] = 0; cb[2] = s->seq + 1; cmd->SetComputeRoot32BitConstants(3, 14, cb, 0);   // spin with 0 polls: flag < seq+1 -> st[0] = 0
+                cmd->SetPipelineState(s->spin); cmd->Dispatch(1, 1, 1); cmd->ResourceBarrier(1, &uav);
+                cmd->SetPipelineState(s->exp); cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1); cmd->ResourceBarrier(1, &uav);
+                return 1;
+            }
             cmd->SetPipelineState(s->imp); cmd->Dispatch((F->W + 7) / 8, (F->H + 7) / 8, 1); cmd->ResourceBarrier(1, &uav);
             auto tr = [&](D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) { D3D12_RESOURCE_BARRIER t = {}; t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; t.Transition.pResource = s->sig; t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; t.Transition.StateBefore = a; t.Transition.StateAfter = b; cmd->ResourceBarrier(1, &t); };
             tr(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -445,6 +519,31 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
             c2->WriteBufferImmediate(1, &wp, &wm);                  // input is in io: release the HIP stream
             tr(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
             cmd->SetPipelineState(s->spin); cmd->Dispatch(1, 1, 1); cmd->ResourceBarrier(1, &uav);   // wait (bounded) for the HIP stream's flag_out = seq
+            if (g_fg) { cmd->SetPipelineState(s->cap); cmd->Dispatch((F->W + 7) / 8, (F->H + 7) / 8, 1); cmd->ResourceBarrier(1, &uav); }
+            if (e5) {                                               // R9G9B9E5 has no typed UAV store: pack into a buffer, copy into the texture
+                const UINT pitch = (w * 4 + 255) & ~255u;
+                if (!s->ob || s->obW != w || s->obH != h) {
+                    if (s->ob) s->ob->Release(); s->ob = nullptr; D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
+                    D3D12_RESOURCE_DESC bd = {}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)pitch * h; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+                    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    HRESULT hr = F->dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&s->ob));
+                    if (FAILED(hr)) { s->ob = nullptr; logf("sync: R9G9B9E5 staging buffer failed (0x%08lx) - native frame", (unsigned long)hr); return 0; }
+                    s->obW = w; s->obH = h; logf("sync: output is R9G9B9E5 - packed in a shader and copied (%ux%u)", w, h);
+                }
+                cmd->SetComputeRootUnorderedAccessView(4, s->ob->GetGPUVirtualAddress());
+                cmd->SetPipelineState(s->expPk); cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+                D3D12_RESOURCE_BARRIER b[2] = {}; for (auto& x : b) { x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+                b[0].Transition.pResource = s->ob; b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b[1].Transition.pResource = out; b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                cmd->ResourceBarrier(2, b);
+                D3D12_TEXTURE_COPY_LOCATION dl = {}, sl = {}; dl.pResource = out; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                sl.pResource = s->ob; sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; sl.PlacedFootprint.Footprint = {DXGI_FORMAT_R9G9B9E5_SHAREDEXP, w, h, 1, pitch};
+                D3D12_BOX bx = {0, 0, 0, w, h, 1}; cmd->CopyTextureRegion(&dl, 0, 0, 0, &sl, &bx);
+                for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+                cmd->ResourceBarrier(2, b);
+                return 1;
+            }
+            cmd->SetComputeRootUnorderedAccessView(4, s->st->GetGPUVirtualAddress());   // unused by exp; bound so the root signature is complete
             cmd->SetPipelineState(s->exp); cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1); cmd->ResourceBarrier(1, &uav);
             return 1;
         }
