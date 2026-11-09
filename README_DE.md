@@ -23,6 +23,8 @@ Diese Mod bringt es auf **AMD-Radeon-RX-6000-Karten** (RDNA2).
 > **Experimentell.** Kann abstürzen, falsch aussehen oder viele FPS kosten. Nicht in Online-Spielen
 > mit Anti-Cheat benutzen.
 
+**Neu in v0.5.2:** Netz bei 1440p ~14 % schneller (schnellere FP8-Nachbildung, Kernel-Tuning), 71-85 % weniger weiß springende Pixel (`split_fade=5`). Details: [CHANGELOG.md](CHANGELOG.md).
+
 **Neu in v0.5: der echte DLSS-5-Look.**
 - Frühere Versionen haben die Detail-Teile des Netzes in 720p/540p gerechnet, also mit einem Viertel von NVIDIAs Pixeln, deshalb wirkte der Effekt schwach. **v0.5 rechnet sie in deiner Ausgabe-Auflösung** (Hybrid-Modus, Standard): etwa **3x** der Effekt von v0.4 in Cyberpunk bei 1440p.
 - **Ghosting behoben** in Spielen mit Upscaler (Bewegungsvektoren waren falsch skaliert), **sauberes `nr_split`** (Ergebnisse werden eingeblendet), **Absturz behoben** beim Neuaufsetzen von NR.

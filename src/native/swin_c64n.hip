@@ -8,7 +8,11 @@
 #include "swin_common.h"
 
 #ifndef WPE
+#ifdef Q8FAST
+#define WPE 3   // Q8FAST: fewer VGPRs needed, 3 waves/SIMD is 0.23 ms faster at 1440p
+#else
 #define WPE 4
+#endif
 #endif
 
 typedef const __attribute__((address_space(4))) uint32_t* cwp;
@@ -24,6 +28,9 @@ constexpr int UG0 = S_END, WR0 = UG0 + 64, WD0 = WR0 + 4096, S_END2 = WD0 + 4096
 
 __device__ __forceinline__ float pow2s(float m) { int e; frexpf(m, &e); return m > 0.f ? ldexpf(1.f, e - 7) : 1.f; }
 __device__ __forceinline__ uint32_t q8h(uint32_t xb) {   // pk(q8(f16r(a)), q8(f16r(b))) from xb = pk(a, b) (swin_c32)
+#ifdef Q8FAST
+  return (xb + 0x00400040u) & 0xFF80FF80u;
+#endif
   typedef unsigned short u2 __attribute__((ext_vector_type(2)));
   const u2 ab = __builtin_elementwise_min(__builtin_bit_cast(u2, xb & 0x7FFF7FFFu), (u2){0x5F00, 0x5F00});
   const u2 eb = __builtin_elementwise_max(ab & (u2){0x7C00, 0x7C00}, (u2){0x2400, 0x2400});
@@ -32,6 +39,13 @@ __device__ __forceinline__ uint32_t q8h(uint32_t xb) {   // pk(q8(f16r(a)), q8(f
   return (__builtin_bit_cast(uint32_t, r) & 0x7FFF7FFFu) | (xb & 0x80008000u);
 }
 __device__ __forceinline__ uint32_t e4h(uint32_t r) {   // e4m3 bytes of a q8h word (swin_c32)
+#ifdef Q8BYTE   // f16 bits >> 7 - 64 (sat): tiny values below 2^-6 flush to 0
+  { typedef unsigned short u2b_ __attribute__((ext_vector_type(2))); const u2b_ a_ = __builtin_elementwise_min(__builtin_bit_cast(u2b_, r & 0x7FFF7FFFu), (u2b_){0x5F00, 0x5F00}) >> (u2b_){7, 7};
+    return __builtin_bit_cast(uint32_t, __builtin_elementwise_sub_sat(a_, (u2b_){64, 64})) | ((r & 0x80008000u) >> 8); }
+#endif
+#ifdef Q8FAST
+  { typedef unsigned short u2_ __attribute__((ext_vector_type(2))); r = (r & 0x80008000u) | __builtin_bit_cast(uint32_t, __builtin_elementwise_min(__builtin_bit_cast(u2_, r & 0x7FFF7FFFu), (u2_){0x5F00, 0x5F00})); }
+#endif
   typedef unsigned short u2 __attribute__((ext_vector_type(2)));
   const u2 ab = __builtin_bit_cast(u2, r & 0x7FFF7FFFu);
   const u2 nb = ((ab - (u2){0x2400, 0x2400}) >> (u2){7, 7}) + (u2){8, 8};

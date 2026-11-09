@@ -51,6 +51,9 @@ struct PostParams {
 // nearest e4m3 (ties even), saturating at 448; branchless. Normal range: round the f32 mantissa to 3 bits;
 // below 2^-6 the fixed 2^-9 step: adding 2^-9 * 1.5 * 2^23 (= 24576, ulp 2^-9) rounds to that step exactly.
 __device__ __forceinline__ float q8(float x) {
+#ifdef Q8FAST   // f16 + 3-bit mantissa only (2 int ops): keeps the look (CPU 45.3 dB to NVIDIA), no clamp (only swin needs it), no subnormal grid / ties-even
+  { const uint32_t q_ = ((uint32_t)__builtin_bit_cast(unsigned short, (_Float16)x) + 0x40u) & 0xFF80u; return (float)__builtin_bit_cast(_Float16, (unsigned short)q_); }
+#endif
 #if KO_Q8
   return x;
 #elif Q8F
@@ -73,6 +76,9 @@ __device__ __forceinline__ h2 pk(float a, float b) { h2 r; r.x = (_Float16)a; r.
 // q8 of two f16 values at once (packed f16 math): K = max(2^exp, 2^-6) * 2^7 gives f16 ulp 2^(exp-3) (2^-9 below 2^-6),
 // so (a + K) - K is the same RNE as q8 (ties: both K have even mantissas). Only for inputs already on the f16 grid.
 __device__ __forceinline__ h2 q8h(h2 x) {
+#ifdef Q8FAST
+  return __builtin_bit_cast(h2, (__builtin_bit_cast(uint32_t, x) + 0x00400040u) & 0xFF80FF80u);
+#endif
 #if (!defined(PKQ8) || PKQ8) && !KO_Q8
   uint32_t xb = __builtin_bit_cast(uint32_t, x);
   // |x| clamped at 448 and 2^exp floored at 2^-6 as unsigned 16-bit compares (same order as f16 for non-negative

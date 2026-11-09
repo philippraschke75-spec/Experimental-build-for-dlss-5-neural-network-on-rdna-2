@@ -18,7 +18,9 @@
 #include "swin_common.h"
 
 #ifndef WPE
+#ifndef WPE
 #define WPE 5
+#endif
 #endif
 constexpr int HPG = 2;   // hidden pairs per MLP step
 
@@ -61,6 +63,9 @@ __device__ __forceinline__ void gemv(float* acc, const uint32_t* a, cwp w) {
 // q8 for values known finite (no NaN guard), rounding by (a + K) - K with K = 2^(max(e, -6) + 20): one f32 rounding
 // to 3 mantissa bits (2^-9 steps below 2^-6), ties to even = q8's bit trick; checked for every finite f32 (q8f_chk.py)
 __device__ __forceinline__ float q8f(float x) {
+#ifdef Q8FAST   // f16 + 3-bit mantissa only (2 int ops): keeps the look (CPU 45.3 dB to NVIDIA), no clamp (only swin needs it), no subnormal grid / ties-even
+  { const uint32_t q_ = ((uint32_t)__builtin_bit_cast(unsigned short, (_Float16)x) + 0x40u) & 0xFF80u; return (float)__builtin_bit_cast(_Float16, (unsigned short)q_); }
+#endif
   const float a = fminf(fabsf(x), 448.f);
   const float K = __uint_as_float(max(__float_as_uint(a) & 0x7F800000u, 0x3C800000u) + (20u << 23));
   return copysignf(__fsub_rn(__fadd_rn(a, K), K), x);
@@ -70,6 +75,9 @@ __device__ __forceinline__ uint32_t pkz(float a, float b) { return __builtin_bit
 // pk(q8(f16r(a)), q8(f16r(b))) from xb = pk(a, b), both halves at once on the f16 grid (q8h of swin_var / pre/post_native,
 // proof q8h_cpu.py); finite inputs (an f16 overflow to inf still gives 448 like q8)
 __device__ __forceinline__ uint32_t q8h(uint32_t xb) {
+#ifdef Q8FAST
+  return (xb + 0x00400040u) & 0xFF80FF80u;
+#endif
   typedef unsigned short u2 __attribute__((ext_vector_type(2)));
   const u2 ab = __builtin_elementwise_min(__builtin_bit_cast(u2, xb & 0x7FFF7FFFu), (u2){0x5F00, 0x5F00});
   const u2 eb = __builtin_elementwise_max(ab & (u2){0x7C00, 0x7C00}, (u2){0x2400, 0x2400});
@@ -81,6 +89,13 @@ __device__ __forceinline__ uint32_t q8h(uint32_t xb) {
 // to >= 448 below 2^-6; subnormal = |v| * 512 = bits(1024 + |v| * 512) - 0x6400, which is >= the normal code for
 // normals; so the u16 min picks. Sign only for nonzero (to_e4m3(-0) = 0). Exhaustive check: perf_c32b src/q8chk.py.
 __device__ __forceinline__ uint32_t e4h(uint32_t r) {
+#ifdef Q8BYTE   // f16 bits >> 7 - 64 (sat): tiny values below 2^-6 flush to 0
+  { typedef unsigned short u2b_ __attribute__((ext_vector_type(2))); const u2b_ a_ = __builtin_elementwise_min(__builtin_bit_cast(u2b_, r & 0x7FFF7FFFu), (u2b_){0x5F00, 0x5F00}) >> (u2b_){7, 7};
+    return __builtin_bit_cast(uint32_t, __builtin_elementwise_sub_sat(a_, (u2b_){64, 64})) | ((r & 0x80008000u) >> 8); }
+#endif
+#ifdef Q8FAST
+  { typedef unsigned short u2_ __attribute__((ext_vector_type(2))); r = (r & 0x80008000u) | __builtin_bit_cast(uint32_t, __builtin_elementwise_min(__builtin_bit_cast(u2_, r & 0x7FFF7FFFu), (u2_){0x5F00, 0x5F00})); }
+#endif
   typedef unsigned short u2 __attribute__((ext_vector_type(2)));
   const u2 ab = __builtin_bit_cast(u2, r & 0x7FFF7FFFu);
   const u2 nb = ((ab - (u2){0x2400, 0x2400}) >> (u2){7, 7}) + (u2){8, 8};

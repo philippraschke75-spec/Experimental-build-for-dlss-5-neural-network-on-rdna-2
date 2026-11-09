@@ -21,6 +21,9 @@ __device__ __forceinline__ uint32_t e4x2(uint32_t u) {   // two e4m3 bytes (low 
 }
 __device__ __forceinline__ uint2 cvt4(uint32_t d) { return make_uint2(e4x2(d & 0xFFFFu), e4x2(d >> 16)); }
 __device__ __forceinline__ float q8(float x) {   // f32 -> nearest e4m3 (RNE, saturating)
+#ifdef Q8FAST   // f16 + 3-bit mantissa only (2 int ops): keeps the look (CPU 45.3 dB to NVIDIA), no clamp (only swin needs it), no subnormal grid / ties-even
+  { const uint32_t q_ = ((uint32_t)__builtin_bit_cast(unsigned short, (_Float16)x) + 0x40u) & 0xFF80u; return (float)__builtin_bit_cast(_Float16, (unsigned short)q_); }
+#endif
   x = x == x ? x : 0.f;   // NaN publishes as +0 (OpenDLSS-NR numerics.md), not as the saturated 448
   float a = fminf(fabsf(x), 448.f);
   uint32_t b = __float_as_uint(a);
@@ -29,11 +32,22 @@ __device__ __forceinline__ float q8(float x) {   // f32 -> nearest e4m3 (RNE, sa
   return copysignf(a < 0.015625f ? rs : rn, x);
 }
 __device__ __forceinline__ uint32_t to_e4m3(float v) {   // v on the e4m3 grid
+#ifdef Q8BYTE   // f16 bits >> 7 - 64 (sat): tiny values below 2^-6 flush to 0
+  { const uint32_t h_ = __builtin_bit_cast(unsigned short, (_Float16)v); const uint32_t a_ = min(h_ & 0x7FFFu, 0x5F00u) >> 7;
+    return (a_ > 64u ? a_ - 64u : 0u) | ((h_ >> 8) & 0x80u); }
+#endif
+#ifdef Q8FAST   // the rounding no longer clamps; a byte store must
+  v = copysignf(fminf(fabsf(v), 448.f), v);
+#endif
   float a = fabsf(v);
   uint32_t b = a < 0.015625f ? (uint32_t)(a * 512.f) : ((__float_as_uint(a) >> 20) - 960u);
   return b | (v < 0.f ? 0x80u : 0u);
 }
 __device__ __forceinline__ uint32_t e4m3_byte(float x) {   // nearest e4m3 byte of x; a negative value that rounds to 0 gives 0x80, -0.0 gives 0x00 (as the translated epilogues)
+#ifdef Q8BYTE   // f16 bits >> 7 - 64 (sat): tiny values below 2^-6 flush to 0
+  { const uint32_t h_ = ((uint32_t)__builtin_bit_cast(unsigned short, (_Float16)x) + 0x40u) & 0xFF80u; const uint32_t a_ = min(h_ & 0x7FFFu, 0x5F00u) >> 7;
+    return (a_ > 64u ? a_ - 64u : 0u) | ((h_ >> 8) & 0x80u); }
+#endif
   if (x != x) return 0u;   // NaN -> +0
   const uint32_t s = x < 0.f ? 0x80u : 0u;
   const float a = fminf(fabsf(x), 448.f);

@@ -356,6 +356,7 @@ static bool hist_begin(nr_ctx* c, hipStream_t s, int valid, const uint8_t* src) 
       if (k.size() >= 0x48) { memcpy(k.data() + 0x40, &p, 8); if (st.ov) nr_apply_override(*st.ov, st.src, st.ka); } }
     c->hist_mask = mask;
   }
+  static const int seed_env = getenv("NR_SEED_MODE") ? atoi(getenv("NR_SEED_MODE")) : -1; if (seed_env >= 0) c->seed_mode = seed_env;
   if (c->seed_mode) {   // NVIDIA: the frame counter is the noise seed, held at 0 while there is no history
     c->seed_n = v ? c->seed_n + 1 : 0;
     if (c->seed_n != c->seed_cur) {

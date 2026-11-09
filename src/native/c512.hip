@@ -21,6 +21,9 @@ __device__ __forceinline__ uint32_t e4x2(uint32_t u) {   // two e4m3 bytes (low 
 }
 __device__ __forceinline__ uint2 cvt4(uint32_t d) { return make_uint2(e4x2(d & 0xFFFFu), e4x2(d >> 16)); }
 __device__ __forceinline__ float q8(float x) {   // f32 -> nearest e4m3 (RNE, saturating), from native-mid
+#ifdef Q8FAST   // f16 + 3-bit mantissa only (2 int ops): keeps the look (CPU 45.3 dB to NVIDIA), no clamp (only swin needs it), no subnormal grid / ties-even
+  { const uint32_t q_ = ((uint32_t)__builtin_bit_cast(unsigned short, (_Float16)x) + 0x40u) & 0xFF80u; return (float)__builtin_bit_cast(_Float16, (unsigned short)q_); }
+#endif
   x = x == x ? x : 0.f;   // NaN publishes as +0 (OpenDLSS-NR numerics.md), not as the saturated 448
   float a = fminf(fabsf(x), 448.f);
   uint32_t b = __float_as_uint(a);
@@ -29,6 +32,13 @@ __device__ __forceinline__ float q8(float x) {   // f32 -> nearest e4m3 (RNE, sa
   return copysignf(a < 0.015625f ? rs : rn, x);
 }
 __device__ __forceinline__ uint32_t to_e4m3(float v) {   // v on the e4m3 grid
+#ifdef Q8BYTE   // f16 bits >> 7 - 64 (sat): tiny values below 2^-6 flush to 0
+  { const uint32_t h_ = __builtin_bit_cast(unsigned short, (_Float16)v); const uint32_t a_ = min(h_ & 0x7FFFu, 0x5F00u) >> 7;
+    return (a_ > 64u ? a_ - 64u : 0u) | ((h_ >> 8) & 0x80u); }
+#endif
+#ifdef Q8FAST   // the rounding no longer clamps; a byte store must
+  v = copysignf(fminf(fabsf(v), 448.f), v);
+#endif
   float a = fabsf(v);
   uint32_t b = a < 0.015625f ? (uint32_t)(a * 512.f) : ((__float_as_uint(a) >> 20) - 960u);
   return b | (v < 0.f ? 0x80u : 0u);
@@ -533,12 +543,22 @@ extern "C" __global__ void __launch_bounds__(256, ATTN_WAVES) ATTN_ATTR k_qkv_at
     Inv[tid] = __fdiv_rn(1.f, fmaxf(__fadd_rn(hv[0], hv[1]), 6.103515625e-05f));
   }
   __syncthreads();
+  {   // P = store8(Pr * inv) once per element, in place (the 4 threads of a query each recomputed all 64 before; 3z).
+      // store8 is on the e4m3 grid, so the f16 holds it exactly: the P.V loop below sees the same values.
+    const int i = tid >> 2;
+    const float inv = Inv[i];
+#pragma unroll
+    for (int l = 0; l < 16; l++) {
+      const int j = (tid & 3) + 4 * l;
+      Pr[i * 66 + j] = (f16)store8(__fmul_rn((float)Pr[i * 66 + j], inv));
+    }
+  }
+  __syncthreads();
   {
     const int i = tid >> 2, cg = (tid & 3) * 8, tile = win_tile(i >> 4);
-    const float inv = Inv[i];
     float c8[8] = {};
     for (int j = 0; j < 64; j++) {
-      const float pj = store8(__fmul_rn((float)Pr[i * 66 + j], inv));
+      const float pj = (float)Pr[i * 66 + j];
 #pragma unroll
       for (int c = 0; c < 8; c++) c8[c] = fmaf(pj, Vs[j * 33 + cg + c], c8[c]);
     }

@@ -7,7 +7,7 @@
 //   k_conv_res_views_n   k_conv_res_views  split_swin.SplitProjPool: projection + residual, plus the 2x2-mean copy
 // Math from the MIT reference (E:\dlss 5\dlssnr-pytorch) and measured input -> output behaviour (kcmp.cpp); kernarg
 // layouts are the manifest's, so the overrides copy the original kernarg unchanged. Layout helpers: nk_common.h.
-#include "nk_common.h"
+#include "nk_common_io.h"   // io_head keeps its own copy (no nr_params.h; it defines its own kernarg structs)
 
 // ---------------------------------------------------------------------------------------------------------------
 // k_import (mode 0, format 0 = RGBA16F): out[y][x] = rgb(src[m(y)][m(x)]) as f32 over the padded extent; the padding
@@ -299,15 +299,29 @@ extern "C" __global__ void __launch_bounds__(256) k_attention_n(AttnParams1d P) 
   for (int d = 0; d < 32; d++) q[d] = qi < P.n ? e4f(P.q[tok_byte(qi, h * 32 + d)]) : 0.f;
   float num[8] = {};
   f16 den = 0;
+  // K/V staging: 4 channel bytes per load (channels r..r+3 are contiguous), and the next group's words are fetched into
+  // registers before this group's math, so the global latency hides behind it (same values as byte loads: bit-identical)
+  uint32_t kw[2], vw[2];
+  const auto fetch = [&](int g) {
+#pragma unroll
+    for (int u = 0; u < 2; u++) {   // i = tid + 256 u = key * 8 + 4-channel chunk
+      const int i = tid + 256 * u, key = g * 64 + (i >> 3);
+      const size_t o = tok_byte(key, h * 32 + (i & 7) * 4);
+      kw[u] = key < P.ntok ? *(const uint32_t*)(P.k + o) : 0u;
+      vw[u] = key < P.ntok ? *(const uint32_t*)(P.v + o) : 0u;
+    }
+  };
+  fetch(0);
   for (int g = 0; g * 64 < P.ntok; g++) {
     __syncthreads();
-    for (int i = tid; i < 64 * 32; i += 256) {   // i = key * 32 + channel
-      const int key = g * 64 + (i >> 5);
-      const size_t o = tok_byte(key, h * 32 + (i & 31));
-      ks[i >> 5][i & 31] = key < P.ntok ? e4f(P.k[o]) : 0.f;
-      vs[i >> 5][i & 31] = key < P.ntok ? e4f(P.v[o]) : 0.f;
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int i = tid + 256 * u, c0 = (i & 7) * 4;
+#pragma unroll
+      for (int b = 0; b < 4; b++) { ks[i >> 3][c0 + b] = e4f(kw[u] >> 8 * b); vs[i >> 3][c0 + b] = e4f(vw[u] >> 8 * b); }
     }
     __syncthreads();
+    if ((g + 1) * 64 < P.ntok) fetch(g + 1);
 #pragma unroll 4
     for (int c = 0; c < 16; c++) {
       const float* kr = ks[dg * 16 + c];

@@ -1,6 +1,6 @@
 # DLSS 5 Neural Rendering on AMD RX 6000 cards (experimental)
 
-**Deutsch:** [README_DE.md](README_DE.md) · **Download:** [latest release (v0.5)](../../releases/latest) · **Changes:** [CHANGELOG.md](CHANGELOG.md)
+**Deutsch:** [README_DE.md](README_DE.md) · **Download:** [latest release (v0.5.2)](../../releases/latest) · **Changes:** [CHANGELOG.md](CHANGELOG.md)
 
 ![DLSS 5 off vs on, Cyberpunk 2077, RX 6900 XT](images/v05_compare.jpg)
 
@@ -71,6 +71,8 @@ that produces the edit. Weights and activations are **FP8 (e4m3)**; NVIDIA runs 
 
 Measured on the same RX 6900 XT at 720p, same new model, same benchmark harness: **this port 10.8 ms vs 19.4 ms** for another
 public vendor-neutral port of the network. With frame generation (FSR-FG / XeFG) the displayed frame rate roughly doubles.
+
+**New in v0.5.2** (full list in the [release notes](../../releases/tag/v0.5.2)): network ~14 % faster at 1440p (fast FP8 emulation, kernel tuning), 71-85 % fewer "white jumping" grain pixels (`split_fade=5`).
 
 **New in v0.5** (full list in the [release notes](../../releases/tag/v0.5)): hybrid mode at output resolution, ghosting fix for
 upscaled motion vectors, clean `nr_split` (fade-in, halo fix, motion gate), crash fix when NR is re-created, faster

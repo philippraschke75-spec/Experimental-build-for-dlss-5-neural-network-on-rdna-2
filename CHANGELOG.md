@@ -1,5 +1,34 @@
 # Changelog (DLSS 5 Neural Rendering, AMD RDNA2 port)
 
+## v0.5.2 (2026-11-09, experimental pre-release)
+
+Faster network and much less "white jumping" grain. Same model (NVIDIA's new small model, 310.9.16).
+
+**Faster network (~14 % at 1440p)**
+- The FP8 (e4m3) emulation of the activations is now a 2-instruction rounding on f16 bits (3-bit mantissa, ±448 clamp only where needed) instead of the exact emulation; shorter e4m3 byte conversions; per-kernel occupancy and compiler mode tuned; built with ROCm 6.4.
+- Not byte-identical to v0.5.1 any more: 46.8 dB to v0.5.1, distance to NVIDIA's output unchanged (33.3 vs 33.5 dB on our test frame), effect strength unchanged.
+- Network time, RX 6900 XT:
+
+| Output | v0.5.1 | v0.5.2 |
+|---|---|---|
+| 1080p | 16.3 ms | 14.4 ms (-11.5 %) |
+| 1440p | 27.4 ms | 23.5 ms (-14 %) |
+| 4K | 58.0 ms | 50.5 ms (-13 %) |
+
+In game this is roughly +7-10 % FPS, depending on how much the game itself costs.
+
+**Less grain: `split_fade=5` (was 3)**
+- A new network result now fades in over 5 frames. Test (1440p, test_sync): white jumping pixels on a still camera 999 -> 291 (-71 %), on a pan 2809 -> 420 (-85 %), effect -1 %.
+- More fade can mean a little more trailing on very fast motion; `split_fade=4` or `3` brings back the old behaviour.
+
+**Source (src/)**
+- `Q8FAST` / `Q8BYTE` build options in all rounding helpers; `src/native/build.sh` now builds exactly the shipped v0.5.2 kernels (CU/WGP mode and fast-math per module, occupancy per kernel).
+- Public sources synced with the shipped kernels (`swin_var.hip`, `c512.hip`, `io_head.hip`); added the missing `wstage.h`; `io_head.hip` uses its own `nk_common_io.h`.
+- Removed `images/ingame1.jpg` / `ingame2.jpg`: they showed an RTGI mod, not DLSS 5.
+
+**Known issue**
+- One report (Cyberpunk 2077) of a light, regular micro-stutter every few seconds; cause not found yet (our log is clean, no skipped or native frames).
+
 ## v0.5.1 (2026-10-22, experimental pre-release)
 
 Same look as v0.5 (the network output is byte-identical), a bit faster, plus a grain filter and a new experimental pipeline mode. The default settings stay safe; the pipeline is opt-in.

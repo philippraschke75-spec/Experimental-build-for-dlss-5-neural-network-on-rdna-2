@@ -88,6 +88,9 @@ __device__ void decode_weights(const uint8_t* r, int t) {
 
 // ---- math helpers (as native-swin32)
 __device__ __forceinline__ float q8(float x) {
+#ifdef Q8FAST   // f16 + 3-bit mantissa only (2 int ops): keeps the look (CPU 45.3 dB to NVIDIA), no clamp (only swin needs it), no subnormal grid / ties-even
+  { const uint32_t q_ = ((uint32_t)__builtin_bit_cast(unsigned short, (_Float16)x) + 0x40u) & 0xFF80u; return (float)__builtin_bit_cast(_Float16, (unsigned short)q_); }
+#endif
   float a = fminf(fabsf(x), 448.f);
   uint32_t b = __float_as_uint(a);
   float rn = __uint_as_float((b + 0x7FFFFu + ((b >> 20) & 1u)) & 0xFFF00000u);
@@ -96,6 +99,10 @@ __device__ __forceinline__ float q8(float x) {
 }
 // byte code of an e4m3-grid value
 __device__ __forceinline__ uint32_t e4m3_code(float v) {
+#ifdef Q8BYTE   // f16 bits >> 7 - 64 (sat): tiny values below 2^-6 flush to 0
+  { const uint32_t h_ = __builtin_bit_cast(unsigned short, (_Float16)v); const uint32_t a_ = min(h_ & 0x7FFFu, 0x5F00u) >> 7;
+    return (a_ > 64u ? a_ - 64u : 0u) | ((h_ >> 8) & 0x80u); }
+#endif
   uint32_t b = __float_as_uint(v), s = (b >> 24) & 0x80;
   float a = fabsf(v);
   if (a < 0.015625f) return s | (uint32_t)(a * 512.f);
@@ -106,6 +113,9 @@ __device__ __forceinline__ float dot2(h2 a, h2 b, float c) { return __builtin_am
 __device__ __forceinline__ h2 pk(float a, float b) { h2 r; r.x = (_Float16)a; r.y = (_Float16)b; return r; }
 // q8 of two f16 values at once (from post_native.hip; proof q8h_cpu.py): bit-equal to q8 on the f16 grid
 __device__ __forceinline__ h2 q8h(h2 x) {
+#ifdef Q8FAST
+  return __builtin_bit_cast(h2, (__builtin_bit_cast(uint32_t, x) + 0x00400040u) & 0xFF80FF80u);
+#endif
   uint32_t xb = __builtin_bit_cast(uint32_t, x);
   typedef unsigned short u2 __attribute__((ext_vector_type(2)));
   u2 ab = __builtin_elementwise_min(__builtin_bit_cast(u2, xb & 0x7FFF7FFFu), (u2){0x5F00, 0x5F00});
