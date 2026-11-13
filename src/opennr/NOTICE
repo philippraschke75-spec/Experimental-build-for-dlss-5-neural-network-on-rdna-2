@@ -1,0 +1,35 @@
+Rdna2NrRuntime - RDNA2 (RX 6000) DLSS-NR runtime behind the lmxxf runtime C ABI v1 (OpenNR host)
+
+rdna2_nr_runtime.cpp, Rdna2NrRuntime.dll, nr_runtime.dll and the nr_data folder (kernel code objects, plans)
+  Copyright (c) 2026 philippraschke75-spec / Emion
+  https://github.com/philippraschke75-spec/Experimental-build-for-dlss-5-neural-network-on-rdna-2
+  License: GNU General Public License v3.0 or later (GPL-3.0-or-later).
+
+LmxxfNrApi.h (the C interface this runtime implements; compiled into Rdna2NrRuntime.dll)
+  OpenNR's version of the lmxxf runtime header, received from the OpenNR maintainers. The interface design
+  (LmxxfNrGetApi, the job model) is lmxxf / Kien's; this runtime only implements it. MIT License:
+
+  MIT License
+
+  Copyright (c) 2026 Kien
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+  documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+  the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+  the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+  WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+  COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Not included (never shipped with this folder)
+  - NVIDIA's nvngx_dlssnr.dll. The network weights are read at runtime from the user's own copy (310.8 or 310.9.16);
+    nr_data carries no NVIDIA weights.
+  - AMD's HIP runtime (amdhip64_6.dll). It comes with the AMD Adrenalin driver.
+
+NVIDIA's model weights are not part of this runtime. They are read at load time from the user's own
+nvngx_dlssnr.dll (310.9.16 or 310.8); nothing from NVIDIA is shipped.

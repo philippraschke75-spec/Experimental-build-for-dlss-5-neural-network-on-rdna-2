@@ -57,6 +57,8 @@ struct nr_ctx {
   // is above `gate` runs in full instead; f0 = frame of the last gated full run (the cadence restarts there).
   volatile float last_mv = -1.f;   // mean |mv| (model px) of the newest job start with motion cells, -1 = none yet (nr_ext_last_motion; pipeline motion slice)
   float gate = 0; size_t mv_off = 0; long f0 = 0; float* mvh = nullptr; int H5 = 0, W5 = 0, bs = 0, nx = 0, ny = 0; int checks = 0, gated = 0; double mv_sum = 0;
+  std::atomic<unsigned> done_seq{0}, proc_seq{0};   // nr_ext_status: last seq whose output was written / last seq the ext thread finished with (ran or dropped)
+  nr_ctx* next = nullptr;   // nr_ext_chain: extra passes, run on this context's stream after its network, each fed the previous pass's output
 };
 #ifndef NR_BUILD_ID
 #define NR_BUILD_ID __DATE__ " " __TIME__
@@ -68,6 +70,8 @@ NR_API void nr_set_log(void (*cb)(const char*)) { g_logcb = cb; }
 // never an iGPU while a dGPU exists. Only RDNA2 dGPUs (gfx1030-1032) unless allow_any. Env NR_HIP_DEVICE=n forces device n, -1 ignores the LUID (tests).
 static unsigned char g_luid[8]; static bool g_haveLuid = false; static int g_allowAny = 0;
 NR_API void nr_select_device(const void* luid, int allow_any) { g_haveLuid = luid != nullptr; if (luid) memcpy(g_luid, luid, 8); g_allowAny = allow_any; }
+static std::string g_weightsDll;   // nr_set_weights_dll: explicit nvngx_dlssnr.dll path, tried before the data dir's parents
+NR_API void nr_set_weights_dll(const char* path) { g_weightsDll = path ? path : ""; }
 static bool is_igpu(const hipDeviceProp_t& p) {
   static const char* ig[] = {"gfx1035", "gfx1036", "gfx1037", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx90c", "gfx902", "gfx909"};
   for (auto a : ig) if (!strncmp(p.gcnArchName, a, strlen(a)) && !isalnum((unsigned char)p.gcnArchName[strlen(a)])) return true;
@@ -92,6 +96,22 @@ static int pick_device(char* err, int errlen) {
   const bool ok = !is_igpu(p) && (!strncmp(p.gcnArchName, "gfx1030", 7) || !strncmp(p.gcnArchName, "gfx1031", 7) || !strncmp(p.gcnArchName, "gfx1032", 7));
   if (!ok && !g_allowAny) { snprintf(err, errlen, "GPU %s (%s) not supported (RDNA2 dGPU gfx1030-1032 required; allow_any_gpu=1 in the ini overrides)", p.name, p.gcnArchName); return -1; }
   return pick;
+}
+// Strict check without creating anything: the HIP device whose LUID matches `luid` (no fallback to another GPU), an RDNA2 dGPU unless allow_any.
+// Returns its index, or -1 with err set. nr_select_device's choice is left as it was.
+NR_API int nr_check_device(const void* luid, int allow_any, char* err, int errlen) {
+  const bool hl = g_haveLuid; unsigned char l0[8]; memcpy(l0, g_luid, 8); const int aa = g_allowAny;
+  g_haveLuid = luid != nullptr; if (luid) memcpy(g_luid, luid, 8); g_allowAny = allow_any;
+  int r = -1, n = 0;
+  if (!luid) snprintf(err, errlen, "no adapter LUID");
+  else if (hipGetDeviceCount(&n) != hipSuccess || n < 1) snprintf(err, errlen, "no HIP device (AMD driver with HIP runtime required)");
+  else {
+    const bool sim = getenv("NR_HIP_DEVICE") && atoi(getenv("NR_HIP_DEVICE")) < 0;   // -1: simulate a LUID mismatch (tests)
+    for (int i = 0; i < n && r < 0; i++) { hipDeviceProp_t p{}; if (hipGetDeviceProperties(&p, i) == hipSuccess && !sim && !memcmp(p.luid, luid, 8)) r = i; }
+    if (r < 0) snprintf(err, errlen, "no HIP device matches the D3D12 adapter (LUID mismatch)");
+    else if (pick_device(err, errlen) != r) r = -1;   // same rules as nr_create (RDNA2 dGPU unless allow_any); err set by pick_device
+  }
+  g_haveLuid = hl; memcpy(g_luid, l0, 8); g_allowAny = aa; return r;
 }
 static void use_dev(nr_ctx* c) { if (c) hipSetDevice(c->devid); }
 static const size_t kStrOff0 = 0x28, kStrOff1 = 0x48;
@@ -139,8 +159,8 @@ static bool upload_arena(nr_ctx* c) {   // pristine arena between two 0xA5 guard
       if ((ok = fscanf(m, "%llu %255s %llu", &ao, nm, &n) == 3 && ao + n <= a.size())) order.push_back(want_rec.insert({nm, {ao, n, false}}));
     fclose(m);
     // nvngx_dlssnr.dll beside the data dir, or up to three levels up (nr_data\<W>x<H>\ and nr_data\<model>\<W>x<H>\ step dirs)
-    for (const char* up : {"/../", "/../../", "/../../../"})
-      if (ok && nr_weights_ht(c->dir + up + "nvngx_dlssnr.dll", res, [&](const std::string& r, const uint8_t* d, uint64_t dn) {
+    for (const std::string& wp : {g_weightsDll, c->dir + "/../nvngx_dlssnr.dll", c->dir + "/../../nvngx_dlssnr.dll", c->dir + "/../../../nvngx_dlssnr.dll"})
+      if (ok && !wp.empty() && nr_weights_ht(wp, res, [&](const std::string& r, const uint8_t* d, uint64_t dn) {
             auto rg = want_rec.equal_range(r);
             for (auto it = rg.first; it != rg.second; ++it) if (it->second.n == dn) { memcpy(a.data() + it->second.ao, d, dn); it->second.done = true; } })) break;
     for (auto it : order) {
@@ -553,16 +573,27 @@ static void ext_thread(nr_ctx* c) {
              hipMemsetAsync(c->d + PAD + c->off_dst, 0, c->dst_size, s) == hipSuccess &&   // k_export accumulates into its destination, see nr_run
              launch_range(c, s, 0, hi); }
       else ok = launch_range(c, s, lo, hi);
-      if (last)
-        ok = ok && hist_end(c, s) &&
-             hipMemcpyAsync(c->io + c->out_off, c->d + PAD + c->off_dst, c->dst_size, hipMemcpyDeviceToDevice, s) == hipSuccess;
+      nr_ctx* tail = c;   // nr_ext_chain: extra passes on this stream, no history (each has its own arena and kernargs)
+      if (last) {
+        ok = ok && hist_end(c, s);
+        nr_ctx* nx; { std::lock_guard<std::mutex> g(c->mx); nx = c->next; }
+        for (; ok && nx; tail = nx, nx = nx->next) {
+          apply_strength(nx);
+          ok = hipMemcpyAsync(nx->d + PAD + nx->off_src, tail->d + PAD + tail->off_dst, nx->src_size, hipMemcpyDeviceToDevice, s) == hipSuccess &&
+               hist_begin(nx, s, 0, nullptr) && hipMemsetAsync(nx->d + PAD + nx->off_dst, 0, nx->dst_size, s) == hipSuccess && launch_all(nx, s);
+          nx->frame++;
+        }
+        ok = ok && hipMemcpyAsync(c->io + c->out_off, tail->d + PAD + tail->off_dst, c->dst_size, hipMemcpyDeviceToDevice, s) == hipSuccess;
+      }
       ok = ok && hipStreamWriteValue32(s, c->io + c->flag_off, seq, 0) == hipSuccess;
       hipStreamSynchronize(s); if (last) c->frame++;
       static const bool tl = getenv("NR_TIMELINE") != nullptr;   // test harness timeline (QPC ms, same clock as test_sync's now()): flag_in seen -> job done
       if (tl) { LARGE_INTEGER f, n; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&n); fprintf(stderr, "TLH %u %d %.3f %.3f\n", seq, part, (double)t_in.QuadPart * 1000.0 / f.QuadPart, (double)n.QuadPart * 1000.0 / f.QuadPart); }
       if (ok && last && ++c->checked == 10) self_check(c);
       if (!ok) fprintf(stderr, "nr_ext: frame %u launch failed\n", seq);
+      if (ok && last) c->done_seq = seq;
     }
+    c->proc_seq = seq;
     c->inflight--;
   }
 }
@@ -629,6 +660,13 @@ NR_API int nr_ext_splitn(nr_ctx* c, int np, int* k_full, int* k_skip, float* ms)
 NR_API int nr_ext_split(nr_ctx* c, int* k_full, int* k_skip, float* ms) {
   if (k_skip && *k_skip <= 0 && k_full && *k_full > 0 && c && c->vit_every <= 1) *k_skip = *k_full;
   return nr_ext_splitn(c, 2, k_full, k_skip, ms);
+}
+NR_API int nr_ext_status(nr_ctx* c, unsigned* done_seq, unsigned* proc_seq, int* inflight) {
+  if (!c) return 1; if (done_seq) *done_seq = c->done_seq; if (proc_seq) *proc_seq = c->proc_seq; if (inflight) *inflight = c->inflight; return 0;
+}
+NR_API int nr_ext_chain(nr_ctx* c, nr_ctx* next) {
+  if (!c || c == next || (next && (next->src_size != c->dst_size || next->devid != c->devid || next->s))) return 1;
+  std::lock_guard<std::mutex> g(c->mx); c->next = next; return 0;
 }
 NR_API int nr_ext_close(nr_ctx* c, int) {
   use_dev(c);

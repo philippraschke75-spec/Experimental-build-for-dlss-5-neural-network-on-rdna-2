@@ -88,3 +88,14 @@ NR_API void nr_set_log(void (*cb)(const char*));
 // Optional, before nr_create: luid = the host's D3D12 adapter LUID (8 bytes, ID3D12Device::GetAdapterLuid) or NULL; allow_any = 1 runs on
 // GPUs other than RDNA2 dGPUs (gfx1030-1032). Without it nr_create picks the dGPU with the most CUs.
 NR_API void nr_select_device(const void* luid, int allow_any);
+// ---- additive (AMDNR lmxxf-ABI runtime, amdnr/rdna2_nr_runtime.cpp)
+// Strict device check, nothing created: the HIP device with exactly this LUID (no fallback), an RDNA2 dGPU unless allow_any. Index or -1 + err.
+NR_API int nr_check_device(const void* luid, int allow_any, char* err, int errlen);
+// Explicit nvngx_dlssnr.dll for the weights (tried before the data dir's parents); NULL/"" = parents only. Before nr_create.
+NR_API void nr_set_weights_dll(const char* path);
+// Ext path progress without waiting: done_seq = last seq whose output reached io (flag_out written), proc_seq = last seq the ext thread
+// finished with (ran, or dropped after its flag_in timeout), inflight = queued + running. Any pointer may be NULL.
+NR_API int nr_ext_status(nr_ctx*, unsigned* done_seq, unsigned* proc_seq, int* inflight);
+// Extra passes: after its network, c runs `next` (and next's own next, ...) on its stream, each fed the previous pass's output, no history;
+// the last pass's output goes to io. next: same size and device, never nr_ext_open'ed. NULL unchains. Destroy c before its chain.
+NR_API int nr_ext_chain(nr_ctx* c, nr_ctx* next);
