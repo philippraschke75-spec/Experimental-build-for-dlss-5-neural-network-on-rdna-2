@@ -1,4 +1,71 @@
-# Changelog (DLSS 5 Neural Rendering, AMD RDNA2 port)
+# Changelog (HexNeural, formerly the DLSS 5 NR port for AMD RDNA2)
+
+## v1.0.0 HexNeural (2026-11-17)
+
+**Our biggest release, and no longer experimental.** The project is now **HexNeural**: DLSS 5 Neural Rendering, DLSS Super Resolution Model K / M and DLSS 4 Frame Generation on AMD RX 6000 (RDNA2), in one package, tested together in game.
+
+> **Coming to OpenNR:** our RDNA2 runtime is being added to OpenNR within the next few hours.
+> **AMDNR** (the community project, not AMD) plans to ship our port with its **v3.5.6** release.
+
+### In game (Cyberpunk 2077 benchmark, RX 6900 XT, 1440p Quality, NR on, stock clocks)
+
+| Setup | Real fps | Displayed fps |
+|---|---|---|
+| FSR 4.1 + NR | 59.5 | 59.5 |
+| DLSS Model K + NR | 56.1 | 56.1 |
+| DLSS Model K + NR + DLSS 4 FG 2x | 42.0 | **83.8** |
+| DLSS Model K + NR + DLSS 4 FG 6x | 31.6 | **180.1** |
+
+Displayed fps recorded with PresentMon (the game's counter only sees real frames).
+
+### Changes since v0.5.2
+
+**New: DLSS 4 Frame Generation (2x up to 6x)**
+- NVIDIA's DLSS-G networks (weights read from your own `nvngx_dlssg.dll` 310.9.1) on our own RDNA2 runtime: both networks (DL1 once per real frame, DL2 per generated frame) and our own implementation of the frame generation pipeline.
+- **Multi-frame generation 3x-6x** with our own pacing on FSR-FG's swapchain (FFX itself presents only one generated frame).
+- Matches NVIDIA's generated frames (RTX 5070 Ti capture, same game frames) at **63-66 dB**.
+- Offline, 1440p: DL1 0.73 ms, DL2 0.61 ms, rest of the pipeline ~1.17 ms. In game at 6x: 9.7 ms for 5 generated frames.
+- Bounded waits, falls back to the real frame, switches itself off after repeated failures or when it would cost more than it gives.
+
+**New: DLSS Super Resolution Model K and Model M**
+- NVIDIA's transformer upscaler models (converted once from your own `nvngx_dlss.dll` 310.5+) on a WrongGPU-based runtime with our RDNA2 kernels.
+- **Model K: 2.36 ms** at 1440p Quality (1706x960 -> 2560x1440, offline). In game about 1 ms per frame more than FSR 4.1.
+- Model M: ~11.6 ms, labelled "slow on RDNA2" in the menu.
+- Shown as "DLSS Model K" / "DLSS Model M" in the overlay's Upscaler list.
+
+**DLSS 5 Neural Rendering**
+- **New host: OpenNR** (our OptiScaler fork). Our runtime is the `NrBackend=rdna2` backend (`Rdna2NrRuntime.dll`). Replaces the v0.5.2 bridge (`nvngx.dll_dlssnr.dll`, `nr_port.ini`).
+- **Faster network:** 23.5 -> **20.4 ms** at 1440p native with full ViT every frame; 10.8 ms at 960p. int8 paths for ViT and pre/post on by default; ViT runs every 2nd frame by default (`vit_every=2`).
+- The network reads its inputs and writes output and history directly in the shared buffer: 3 copies less per frame.
+- Fix: ~220 ms stalls when a job was turned down.
+- Fix: NR never started when OptiScaler spoofed the GPU (an RX 6800 reported as "RTX 5090"). The GPU is now identified through HIP.
+- **RX 6500 XT / 6400 (gfx1034) supported.** All RDNA2 dGPUs: gfx1030, 1031, 1032, 1034.
+- Split network (`nr_split`) is off and greyed out in the menu: it trailed in motion.
+
+**Everything together**
+- Fix: NR + Frame Generation + Model K stalled (~380 ms per frame) because they share one HIP runtime and HIP's default 4 hardware queues deadlocked. OptiScaler now sets `GPU_MAX_HW_QUEUES=16` before any HIP user loads.
+
+**Overlay (Insert)**
+- Upscaler list with DLSS Model K / M; "RDNA2 network" section (ViT skip, network resolution, Hybrid/Classic); FG output "RDNA2 DLSS-FG" with a live status line and the **RDNA2 FG multiplier** (2x-6x, applies at once); menu in English.
+
+**Package**
+- New layout, no installer: copy the files into the game folder, add your own NVIDIA DLLs. `SHA256SUMS.txt` for every file. No NVIDIA files inside.
+- Coming from v0.5.2: run its `Uninstall_DLSS5.bat` first.
+
+### Offline network times (RX 6900 XT)
+
+| Network | Resolution | Time |
+|---|---|---|
+| DLSS 5 NR, full ViT every frame | 2560x1440 | 20.4 ms |
+| DLSS 5 NR | 1707x960 | 10.8 ms |
+| DLSS SR Model K | 1706x960 -> 2560x1440 | 2.36 ms |
+| DLSS SR Model M | 1706x960 -> 2560x1440 | ~11.6 ms |
+| DLSS 4 FG DL1 / DL2 | 2560x1440 | 0.73 / 0.61 ms |
+
+### Source
+- OptiScaler fork: https://github.com/philippraschke75-spec/OpenNR-OptiScaler/tree/release
+- WrongGPU (MIT): https://github.com/phantoslayer21/wronggpu. Parts based on WrongGPU (github.com/phantoslayer21/wronggpu), MIT.
+
 
 ## v0.5.2 (2026-11-09, experimental pre-release)
 
